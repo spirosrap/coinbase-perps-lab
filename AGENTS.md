@@ -8,6 +8,7 @@ Current scope:
 - create and use a local Python environment
 - load credentials from `.env`
 - inspect Coinbase INTX portfolios and open perpetual positions
+- support both the Python and Rust read-only discovery paths
 
 Default assumption:
 - keep work read-only unless the user explicitly asks for trading, order placement, or account mutations
@@ -28,6 +29,12 @@ Prefer running commands through the repo-local interpreter:
 .venv/bin/python discover_perp_positions.py
 ```
 
+For Rust work, use the repo-local Cargo project:
+
+```bash
+cargo run --bin discover_perp_positions_rust
+```
+
 ## Secrets
 
 - Never commit `.env`
@@ -45,6 +52,7 @@ The current discovery script prefers the perps pair first.
 ## Code guidelines
 
 - Target Python 3.9 compatibility unless the user explicitly upgrades the project runtime
+- Keep Rust code compatible with the checked-in Cargo manifest and stable toolchain
 - Keep dependencies minimal and project-local
 - Prefer small, focused scripts over large frameworks
 - Preserve the repo's read-only posture by default
@@ -53,6 +61,7 @@ The current discovery script prefers the perps pair first.
 ## Coinbase and CCXT notes
 
 - Use `ccxt.coinbase` for the current INTX workflow in this repo
+- Use the direct Rust client for Rust work; do not assume CCXT has official Rust support
 - Fetch portfolios first, then select the `INTX` portfolio before querying positions
 - Prefer returning concise summaries plus optional JSON output for automation
 - When behavior depends on Coinbase or CCXT specifics, verify against current upstream docs or installed library behavior
@@ -69,6 +78,7 @@ The current discovery script prefers the perps pair first.
 - This repo is intended to be public-safe
 - Stage only safe files
 - Confirm `.env` and `.venv` remain ignored before committing
+- Confirm `target/` remains ignored before committing
 - Keep commits scoped and descriptive
 
 ## Validation
@@ -83,4 +93,11 @@ If output format changes, also test:
 
 ```bash
 .venv/bin/python discover_perp_positions.py --json
+```
+
+For Rust changes, also run:
+
+```bash
+cargo run --bin discover_perp_positions_rust
+cargo run --bin discover_perp_positions_rust -- --json
 ```
