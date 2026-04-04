@@ -1,19 +1,18 @@
 # coinbase-perps-lab
 
-Small CCXT-based lab for inspecting Coinbase INTX perpetual positions from a local `.env`.
+Small Rust-based lab for inspecting Coinbase INTX perpetual positions and viewing them in a local dashboard.
 
 ## What this repo does
 
-- Creates an isolated local Python environment in `.venv`
 - Loads Coinbase credentials from `.env`
-- Uses `ccxt` to discover your INTX portfolio and list open perpetual positions
-- Includes a direct Rust implementation for the same read-only workflow plus derived market/risk analytics
+- Uses direct Coinbase REST calls from Rust
+- Lists open INTX perpetual positions from a CLI
+- Serves the same analytics in a local web dashboard
 - Keeps secrets out of git with `.gitignore`
 
 ## Requirements
 
-- Python 3.9+
-- Rust toolchain if you want to use the Rust binary
+- Rust toolchain
 - A Coinbase Advanced Trade / INTX account with perpetuals access
 - Coinbase API credentials that can read portfolio and position data
 
@@ -26,25 +25,7 @@ git clone <your-repo-url>
 cd coinbase-perps-lab
 ```
 
-Create a local virtual environment:
-
-```bash
-python3 -m venv .venv
-```
-
-Activate it:
-
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-If you want the Rust version too, install the standard Rust toolchain:
+Install the standard Rust toolchain:
 
 ```bash
 rustup default stable
@@ -83,29 +64,19 @@ Those optional keys are not required for position discovery, but the template le
 
 ## Usage
 
-Run the read-only position check:
-
-```bash
-.venv/bin/python discover_perp_positions.py
-```
-
-JSON output:
-
-```bash
-.venv/bin/python discover_perp_positions.py --json
-```
-
-Use an explicit portfolio UUID:
-
-```bash
-.venv/bin/python discover_perp_positions.py --portfolio YOUR_INTX_PORTFOLIO_UUID
-```
-
 Run the Rust version:
 
 ```bash
 cargo run --bin discover_perp_positions_rust
 ```
+
+Run the local web dashboard:
+
+```bash
+cargo run --bin perps_dashboard
+```
+
+Then open `http://127.0.0.1:3000` in your browser.
 
 Rust JSON output:
 
@@ -119,6 +90,12 @@ Rust with an explicit portfolio UUID:
 cargo run --bin discover_perp_positions_rust -- --portfolio YOUR_INTX_PORTFOLIO_UUID
 ```
 
+Dashboard with a custom bind address or explicit portfolio UUID:
+
+```bash
+cargo run --bin perps_dashboard -- --bind 127.0.0.1:3000 --portfolio YOUR_INTX_PORTFOLIO_UUID
+```
+
 The Rust output now includes additional derived context per position:
 
 - effective leverage from portfolio collateral, alongside the raw API leverage field
@@ -129,6 +106,8 @@ The Rust output now includes additional derived context per position:
 - open interest and max leverage
 - heuristic market bias and position outlook labels
 - simple scenario projections for `+1%`, `+3%`, `-1%`, and `-3%` moves from the current mark
+
+The dashboard shows the same snapshot in a browser-friendly layout and polls the local backend for refreshes.
 
 ## Interpreting the Rust output
 
@@ -148,36 +127,38 @@ Projections: +1%=3.07 | +3%=9.20 | -1%=-3.07 | -3%=-9.20
 
 This means: if the current mark moves up `1%`, the position's unrealized PnL would increase by about `3.07` quote units; if it moves down `3%`, unrealized PnL would decrease by about `9.20`. These projections do not include fees, funding, slippage, or execution effects.
 
-## What the script does
+## What the tool does
 
 1. Loads variables from `.env`
-2. Connects with `ccxt.coinbase`
+2. Authenticates with Coinbase using ES256 JWTs
 3. Fetches available portfolios
 4. Selects the first `INTX` portfolio unless you pass `--portfolio`
-5. Fetches open positions for that portfolio
+5. Fetches open positions, product metadata, and portfolio summary data
+6. Computes derived analytics and renders them in either CLI or dashboard form
 
-The Rust binary follows the same flow, but it calls Coinbase's REST API directly instead of using CCXT. It also enriches the raw position snapshot with product metadata and portfolio summary data so the output can show additional context without placing trades.
+The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata and portfolio summary data so the output can show additional context without placing trades.
 
-## Python vs Rust
+The dashboard uses the same Rust analysis path. Coinbase credentials stay in the local Rust process; the browser only receives the computed snapshot JSON from `http://127.0.0.1:3000/api/snapshot`.
 
-- The Python script uses official CCXT support for Coinbase
-- Official CCXT does not currently ship a Rust implementation
+## Architecture
+
 - The Rust binary uses direct Coinbase REST calls with ES256 JWT authentication
-- Both tools are read-only and target the same INTX portfolio/positions workflow
-- The Rust tool adds heuristic analytics for context, but it is not a predictive trading model
+- Both Rust binaries are read-only and target the same INTX portfolio/positions workflow
+- The analytics layer is shared between the CLI and dashboard
+- The heuristic analytics are context, not a predictive trading model
+- The dashboard is local-only by default and uses the same read-only Rust snapshot pipeline
 
 ## Security
 
 - `.env` is ignored by git and should never be committed
-- `.venv` is also ignored by git
 - `target/` is ignored by git
 - `.env.example` contains placeholders only
 - Use the least-privileged Coinbase credentials available for your workflow
 
 ## Files
 
-- `discover_perp_positions.py`: read-only Coinbase INTX position discovery
-- `src/bin/discover_perp_positions_rust.rs`: direct Rust version of the same workflow
+- `src/bin/discover_perp_positions_rust.rs`: Rust CLI for live INTX analytics
+- `src/bin/perps_dashboard.rs`: local web dashboard for the same Rust analytics
+- `src/lib.rs`: shared Coinbase snapshot and analytics logic used by both Rust binaries
 - `Cargo.toml`: Rust dependencies and binary definition
-- `requirements.txt`: local Python dependencies
 - `.env.example`: starter environment template

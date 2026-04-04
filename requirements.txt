@@ -1,2 +1,0 @@
-ccxt<5
-python-dotenv

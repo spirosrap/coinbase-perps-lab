@@ -2,37 +2,23 @@
 
 ## Project purpose
 
-This repository is a small CCXT-based lab for Coinbase INTX perpetuals.
+This repository is a small Rust-based lab for Coinbase INTX perpetuals.
 
 Current scope:
-- create and use a local Python environment
 - load credentials from `.env`
 - inspect Coinbase INTX portfolios and open perpetual positions
-- support both the Python and Rust read-only discovery paths
+- support a Rust CLI and a local Rust dashboard for the same read-only analytics path
 
 Default assumption:
 - keep work read-only unless the user explicitly asks for trading, order placement, or account mutations
 
 ## Environment
 
-Use the local virtual environment in this repo:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-Prefer running commands through the repo-local interpreter:
-
-```bash
-.venv/bin/python discover_perp_positions.py
-```
-
 For Rust work, use the repo-local Cargo project:
 
 ```bash
 cargo run --bin discover_perp_positions_rust
+cargo run --bin perps_dashboard
 ```
 
 ## Secrets
@@ -51,20 +37,18 @@ The current discovery script prefers the perps pair first.
 
 ## Code guidelines
 
-- Target Python 3.9 compatibility unless the user explicitly upgrades the project runtime
 - Keep Rust code compatible with the checked-in Cargo manifest and stable toolchain
 - Keep dependencies minimal and project-local
 - Prefer small, focused scripts over large frameworks
 - Preserve the repo's read-only posture by default
 - If you add a mutating script later, make the destructive or trading behavior explicit in the filename and README
 
-## Coinbase and CCXT notes
+## Coinbase notes
 
-- Use `ccxt.coinbase` for the current INTX workflow in this repo
-- Use the direct Rust client for Rust work; do not assume CCXT has official Rust support
+- Use the direct Rust client for Coinbase work in this repo
 - Fetch portfolios first, then select the `INTX` portfolio before querying positions
 - Prefer returning concise summaries plus optional JSON output for automation
-- When behavior depends on Coinbase or CCXT specifics, verify against current upstream docs or installed library behavior
+- When behavior depends on Coinbase specifics, verify against current upstream docs or observed API behavior
 
 ## Documentation rules
 
@@ -77,7 +61,7 @@ The current discovery script prefers the perps pair first.
 
 - This repo is intended to be public-safe
 - Stage only safe files
-- Confirm `.env` and `.venv` remain ignored before committing
+- Confirm `.env` remains ignored before committing
 - Confirm `target/` remains ignored before committing
 - Keep commits scoped and descriptive
 
@@ -85,19 +69,10 @@ The current discovery script prefers the perps pair first.
 
 For changes that affect the current workflow, run:
 
-```bash
-.venv/bin/python discover_perp_positions.py
-```
-
-If output format changes, also test:
-
-```bash
-.venv/bin/python discover_perp_positions.py --json
-```
-
-For Rust changes, also run:
+For Rust changes, run:
 
 ```bash
 cargo run --bin discover_perp_positions_rust
 cargo run --bin discover_perp_positions_rust -- --json
+cargo run --bin perps_dashboard
 ```
