@@ -131,6 +131,15 @@ The dashboard now keeps two time horizons:
 - recent raw history: up to `240` high-resolution samples at the normal refresh interval
 - long-horizon rollups: `5` minute buckets, retained for up to `14` days
 
+The dashboard also adds a conservative setup layer:
+
+- official Fed monetary-policy headlines from the Federal Reserve RSS feed
+- upcoming FOMC dates from the official FOMC calendar
+- a heuristic event-risk level
+- a heuristic setup status and suggested max leverage per position
+
+This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
+
 ## Interpreting the Rust output
 
 - `apiLev` is the raw leverage field returned by Coinbase's position endpoint
@@ -150,6 +159,8 @@ The dashboard now keeps two time horizons:
 - `liqDistance` is the percentage move from the current mark to the estimated liquidation price
 - `market bias` and `position outlook` are heuristic labels derived from 24h price change, basis, funding, entry distance, and liquidation distance
 - `Projections` are simple mark-to-market PnL scenarios, not forecasts
+- `setup status` combines event risk, execution costs, book skew, and heuristic market bias into a conservative status such as `aligned`, `mixed`, or `avoid aggression`
+- `suggested max leverage` is a conservative cap derived from those same inputs and is meant as a risk-control prompt, not an instruction
 
 Example:
 
@@ -213,6 +224,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
 8. Persists that dashboard history to a local JSON file so it survives restarts
 9. Maintains longer-horizon `5` minute rollups so the dashboard can compare current microstructure against a broader recent baseline
+10. In dashboard mode, loads official Fed policy headlines and FOMC schedule context and derives a conservative setup/leverage assessment
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 

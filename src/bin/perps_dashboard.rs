@@ -4,8 +4,11 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{Datelike, NaiveDate, Utc};
 use clap::Parser;
 use coinbase_perps_lab::{load_output, OrderBookSummary, Output, PositionSummary, SlippageEstimate};
+use regex::Regex;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +22,8 @@ const ROLLUP_BUCKET_MS: u64 = 5 * 60 * 1000;
 const MAX_ROLLUP_BUCKETS: usize = 14 * 24 * 12;
 const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
+const FED_MONETARY_FEED_URL: &str = "https://www.federalreserve.gov/feeds/press_monetary.xml";
+const FED_FOMC_CALENDAR_URL: &str = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm";
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -118,6 +123,8 @@ struct DashboardSnapshot {
     #[serde(flatten)]
     output: Output,
     position_history: HashMap<String, PositionHistorySummary>,
+    market_context: MarketContext,
+    setup_assessments: HashMap<String, TradeSetupAssessment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +171,41 @@ struct MetricPoint {
     value: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct MarketContext {
+    headlines: Vec<OfficialHeadline>,
+    upcoming_events: Vec<UpcomingEvent>,
+    event_risk: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OfficialHeadline {
+    source: String,
+    title: String,
+    published_at: Option<String>,
+    link: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct UpcomingEvent {
+    source: String,
+    title: String,
+    scheduled_for: String,
+    days_until: Option<f64>,
+    risk: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TradeSetupAssessment {
+    alignment_status: String,
+    alignment_confidence: String,
+    suggested_max_leverage: f64,
+    event_risk: String,
+    execution_risk: String,
+    notes: Vec<String>,
+}
+
 fn history_format_version() -> u32 {
     2
 }
@@ -173,6 +215,190 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn build_http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent("coinbase-perps-lab/0.1 (+local dashboard)")
+        .build()
+        .context("failed to build HTTP client")
+}
+
+fn get_text(client: &Client, url: &str) -> Result<String> {
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("request failed for GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("remote source returned {status} for GET {url}: {body}");
+    }
+    response
+        .text()
+        .with_context(|| format!("failed to read text body for GET {url}"))
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#8211;", "–")
+}
+
+fn parse_fed_headlines(client: &Client) -> Result<Vec<OfficialHeadline>> {
+    let xml = get_text(client, FED_MONETARY_FEED_URL)?;
+    let item_re = Regex::new(r"(?s)<item>(.*?)</item>").unwrap();
+    let title_re = Regex::new(r"(?s)<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>").unwrap();
+    let link_re = Regex::new(r"(?s)<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</link>").unwrap();
+    let pub_date_re = Regex::new(r"(?s)<pubDate>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</pubDate>").unwrap();
+
+    let mut headlines = Vec::new();
+    for caps in item_re.captures_iter(&xml).take(4) {
+        let item = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let title = title_re
+            .captures(item)
+            .and_then(|caps| caps.get(1).map(|m| decode_html_entities(m.as_str())));
+        let link = link_re
+            .captures(item)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
+        let published_at = pub_date_re
+            .captures(item)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
+
+        if let (Some(title), Some(link)) = (title, link) {
+            headlines.push(OfficialHeadline {
+                source: "Federal Reserve".to_string(),
+                title,
+                published_at,
+                link,
+            });
+        }
+    }
+
+    Ok(headlines)
+}
+
+fn month_name_to_number(name: &str) -> Option<u32> {
+    match name.to_ascii_lowercase().as_str() {
+        "january" => Some(1),
+        "february" => Some(2),
+        "march" => Some(3),
+        "april" => Some(4),
+        "may" => Some(5),
+        "june" => Some(6),
+        "july" => Some(7),
+        "august" => Some(8),
+        "september" => Some(9),
+        "october" => Some(10),
+        "november" => Some(11),
+        "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn date_from_month_and_day(year: i32, month_label: &str, day: u32) -> Option<NaiveDate> {
+    let cleaned = month_label.split('/').next().unwrap_or(month_label).trim();
+    let month = month_name_to_number(cleaned)?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn parse_fomc_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
+    let html = get_text(client, FED_FOMC_CALENDAR_URL)?;
+    let year_re = Regex::new(r#"<a id="42828">(\d{4}) FOMC Meetings</a>"#).unwrap();
+    let year = year_re
+        .captures(&html)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<i32>().ok())
+        .unwrap_or(Utc::now().year());
+    let row_re = Regex::new(
+        r#"(?s)fomc-meeting__month[^>]*><strong>([^<]+)</strong>.*?fomc-meeting__date[^>]*>([^<]+)</div>"#,
+    )
+    .unwrap();
+
+    let today = Utc::now().date_naive();
+    let mut events = Vec::new();
+    for caps in row_re.captures_iter(&html) {
+        let month_label = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        let raw_date = caps.get(2).map(|m| m.as_str().trim()).unwrap_or_default();
+        let first_day = raw_date
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .ok();
+        let Some(first_day) = first_day else {
+            continue;
+        };
+        let Some(date) = date_from_month_and_day(year, month_label, first_day) else {
+            continue;
+        };
+        if date < today {
+            continue;
+        }
+
+        let days_until = (date - today).num_days() as f64;
+        let risk = if days_until <= 1.0 {
+            "high"
+        } else if days_until <= 7.0 {
+            "medium"
+        } else {
+            "low"
+        };
+        events.push(UpcomingEvent {
+            source: "Federal Reserve".to_string(),
+            title: format!("FOMC meeting ({month_label} {raw_date})"),
+            scheduled_for: date.to_string(),
+            days_until: Some(days_until),
+            risk: risk.to_string(),
+        });
+    }
+
+    Ok(events.into_iter().take(3).collect())
+}
+
+fn derive_event_risk(upcoming_events: &[UpcomingEvent]) -> String {
+    if upcoming_events.iter().any(|event| event.risk == "high") {
+        "high".to_string()
+    } else if upcoming_events.iter().any(|event| event.risk == "medium") {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn load_market_context(client: &Client) -> MarketContext {
+    let mut notes = Vec::new();
+    let headlines = match parse_fed_headlines(client) {
+        Ok(items) => items,
+        Err(error) => {
+            notes.push(format!("Fed headline fetch failed: {error:#}"));
+            Vec::new()
+        }
+    };
+    let upcoming_events = match parse_fomc_events(client) {
+        Ok(items) => items,
+        Err(error) => {
+            notes.push(format!("FOMC calendar fetch failed: {error:#}"));
+            Vec::new()
+        }
+    };
+    if notes.is_empty() {
+        notes.push(
+            "Market context is currently driven by official Federal Reserve monetary-policy headlines and the FOMC meeting calendar."
+                .to_string(),
+        );
+    }
+
+    MarketContext {
+        event_risk: derive_event_risk(&upcoming_events),
+        headlines,
+        upcoming_events,
+        notes,
+    }
 }
 
 fn trim_history(history: &mut HashMap<String, PersistedSymbolHistory>) {
@@ -653,6 +879,187 @@ fn summarize_position_history(history: &PersistedSymbolHistory) -> PositionHisto
     }
 }
 
+fn assess_trade_setup(
+    position: &PositionSummary,
+    history: Option<&PositionHistorySummary>,
+    market_context: &MarketContext,
+) -> TradeSetupAssessment {
+    let side = position.side.as_deref().unwrap_or("long");
+    let mut suggested_max_leverage: f64 = 5.0;
+    let mut notes = Vec::new();
+    let mut penalties = 0usize;
+
+    let event_risk = market_context.event_risk.clone();
+    match event_risk.as_str() {
+        "high" => {
+            suggested_max_leverage = suggested_max_leverage.min(2.0);
+            penalties += 2;
+            notes.push(
+                "A scheduled Fed event is close enough that event risk should dominate leverage decisions."
+                    .to_string(),
+            );
+        }
+        "medium" => {
+            suggested_max_leverage = suggested_max_leverage.min(3.0);
+            penalties += 1;
+            notes.push(
+                "A Fed event is within roughly a week, so leverage should stay moderate."
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    let (slip_5k, slip_10k) = position
+        .order_book
+        .as_ref()
+        .map(|book| {
+            let estimates = if side == "short" {
+                &book.sell_slippage
+            } else {
+                &book.buy_slippage
+            };
+            (
+                find_slippage_bps(estimates, 5_000.0),
+                find_slippage_bps(estimates, 10_000.0),
+            )
+        })
+        .unwrap_or((None, None));
+
+    let execution_risk = if slip_10k.unwrap_or(99.0) <= 3.0 {
+        "low"
+    } else if slip_10k.unwrap_or(99.0) <= 8.0 {
+        suggested_max_leverage = suggested_max_leverage.min(5.0);
+        "medium"
+    } else {
+        suggested_max_leverage = suggested_max_leverage.min(3.0);
+        penalties += 1;
+        notes.push(
+            "The visible book starts charging meaningful slippage by $10k notional, so size and leverage should stay restrained."
+                .to_string(),
+        );
+        "high"
+    }
+    .to_string();
+
+    if let Some(imbalance) = position
+        .order_book
+        .as_ref()
+        .and_then(|book| book.top_5_imbalance_pct)
+    {
+        let adverse = match side {
+            "long" => imbalance <= -15.0,
+            "short" => imbalance >= 15.0,
+            _ => false,
+        };
+        if adverse {
+            suggested_max_leverage = suggested_max_leverage.min(3.0);
+            penalties += 1;
+            notes.push(format!(
+                "Near-touch depth is leaning against the intended {side} side at {imbalance:.2}% imbalance."
+            ));
+        }
+    }
+
+    if let Some(long_horizon) = history.and_then(|summary| summary.long_horizon.as_ref()) {
+        if let Some(imbalance) = long_horizon.top_5_imbalance_pct.as_ref() {
+            let adverse = match side {
+                "long" => imbalance.average <= -10.0,
+                "short" => imbalance.average >= 10.0,
+                _ => false,
+            };
+            if adverse {
+                suggested_max_leverage = suggested_max_leverage.min(3.0);
+                penalties += 1;
+                notes.push(format!(
+                    "The longer-horizon depth average is also leaning against the {side} side ({:.2}%).",
+                    imbalance.average
+                ));
+            }
+        }
+    }
+
+    let bias_against_trade = matches!(
+        (side, position.market_bias.as_str()),
+        ("long", "mildly bearish" | "bearish")
+            | ("short", "mildly bullish" | "bullish")
+    );
+    if bias_against_trade {
+        suggested_max_leverage = suggested_max_leverage.min(2.0);
+        penalties += 1;
+        notes.push(format!(
+            "The current heuristic market bias ({}) is working against a {side} trade.",
+            position.market_bias
+        ));
+    }
+
+    if let (Some(funding), Some(direction)) = (
+        position.funding_rate_pct,
+        position.funding_direction.as_deref(),
+    ) {
+        let adverse = (side == "long" && direction == "longs paying shorts" && funding.abs() >= 0.02)
+            || (side == "short" && direction == "shorts paying longs" && funding.abs() >= 0.02);
+        if adverse {
+            suggested_max_leverage = suggested_max_leverage.min(3.0);
+            penalties += 1;
+            notes.push(
+                "Funding is materially charging the intended side, which makes high leverage less forgiving."
+                    .to_string(),
+            );
+        }
+    }
+
+    if notes.is_empty() {
+        notes.push(
+            "Execution costs, book skew, and scheduled event risk are not currently flagging an obvious reason to exceed a conservative leverage cap."
+                .to_string(),
+        );
+    }
+
+    let alignment_status = if penalties == 0 && event_risk == "low" && execution_risk == "low" {
+        "aligned"
+    } else if penalties <= 1 && event_risk != "high" {
+        "mixed"
+    } else {
+        "avoid aggression"
+    }
+    .to_string();
+
+    let alignment_confidence = if history
+        .map(|summary| summary.samples >= 30 || summary.long_horizon.as_ref().map(|roll| roll.buckets >= 6).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        "medium"
+    } else {
+        "low"
+    }
+    .to_string();
+
+    let suggested_max_leverage = match suggested_max_leverage {
+        x if x <= 1.5 => 1.0,
+        x if x <= 2.5 => 2.0,
+        x if x <= 3.5 => 3.0,
+        _ => 5.0,
+    };
+
+    if let Some(slip_5k) = slip_5k {
+        notes.push(format!(
+            "Visible-book slippage for a $5k {} is about {:.2} bps in the current snapshot.",
+            if side == "short" { "sell" } else { "buy" },
+            slip_5k
+        ));
+    }
+
+    TradeSetupAssessment {
+        alignment_status,
+        alignment_confidence,
+        suggested_max_leverage,
+        event_risk,
+        execution_risk,
+        notes,
+    }
+}
+
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -938,6 +1345,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin-bottom: 8px;
       line-height: 1.4;
     }
+    .context-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      margin-top: 18px;
+    }
+    .context-panel {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--panel-strong);
+      padding: 16px;
+    }
+    .headline-list, .context-list {
+      margin: 10px 0 0;
+      padding-left: 18px;
+    }
+    .headline-list li, .context-list li {
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+    .headline-list a {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px solid rgba(29, 35, 43, 0.18);
+    }
+    .headline-list a:hover {
+      border-bottom-color: rgba(29, 35, 43, 0.4);
+    }
     .scenario {
       padding: 16px;
     }
@@ -1080,6 +1515,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function badgeClass(label) {
       const lower = String(label || "").toLowerCase();
       if (lower.includes("bull") || lower.includes("favor") || lower.includes("construct")) return "good";
+      if (lower.includes("aligned") || lower === "low") return "good";
+      if (lower.includes("mixed") || lower === "medium") return "warn";
+      if (lower.includes("avoid") || lower === "high") return "bad";
       if (lower.includes("bear") || lower.includes("risk")) return "bad";
       if (lower.includes("caut")) return "warn";
       return "neutral";
@@ -1181,11 +1619,42 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function positionCard(pos, history) {
+    function marketContextPanels(context) {
+      const headlines = (context?.headlines || [])
+        .map((item) => `<li><a href="${escapeHtml(item.link)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>${item.published_at ? ` <span class="history-meta">${escapeHtml(item.published_at)}</span>` : ""}</li>`)
+        .join("");
+      const events = (context?.upcoming_events || [])
+        .map((item) => `<li><strong>${escapeHtml(item.title)}</strong><br><span class="history-meta">${escapeHtml(item.scheduled_for)}${item.days_until != null ? ` (${formatMaybe(item.days_until, 1)} days)` : ""} · ${escapeHtml(item.risk)} risk</span></li>`)
+        .join("");
+      const notes = (context?.notes || [])
+        .map((item) => `<li>${escapeHtml(item)}</li>`)
+        .join("");
+
+      return `
+        <div class="context-grid">
+          <section class="context-panel">
+            <div class="section-title">Market Context</div>
+            <div class="history-value">${escapeHtml(context?.event_risk || "unknown")} event risk</div>
+            <ul class="context-list">${notes}</ul>
+          </section>
+          <section class="context-panel">
+            <div class="section-title">Official Fed Headlines</div>
+            <ul class="headline-list">${headlines || "<li>No official headlines loaded.</li>"}</ul>
+          </section>
+          <section class="context-panel">
+            <div class="section-title">Upcoming Events</div>
+            <ul class="context-list">${events || "<li>No upcoming official events loaded.</li>"}</ul>
+          </section>
+        </div>
+      `;
+    }
+
+    function positionCard(pos, history, assessment) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const historyInsights = (history?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const longInsights = (history?.long_horizon?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const setupNotes = (assessment?.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
       const spreadValue = pos.order_book?.spread_absolute != null || pos.order_book?.spread_bps != null
         ? `${formatMaybe(pos.order_book?.spread_absolute, 4)} | ${formatBps(pos.order_book?.spread_bps)}`
         : "unknown";
@@ -1197,9 +1666,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div class="subtext">Underlying: ${escapeHtml(pos.underlying_type || "unknown")} | Side: ${escapeHtml(pos.side || "unknown")} | Margin: ${escapeHtml(pos.margin_mode || "unknown")}</div>
             </div>
             <div class="badges">
-              <span class="badge ${badgeClass(pos.market_bias)}">${escapeHtml(pos.market_bias)}</span>
+              <span class="badge ${badgeClass(assessment?.alignment_status || pos.market_bias)}">${escapeHtml(assessment?.alignment_status || pos.market_bias)}</span>
               <span class="badge ${badgeClass(pos.position_outlook)}">${escapeHtml(pos.position_outlook)}</span>
-              <span class="badge neutral">${escapeHtml(pos.outlook_confidence)} confidence</span>
+              <span class="badge neutral">${escapeHtml((assessment?.alignment_confidence || pos.outlook_confidence) + " confidence")}</span>
             </div>
           </div>
 
@@ -1231,6 +1700,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Collateral", pos.collateral || "unknown")}
             ${statCard("Liq Buffer", pos.liquidation_buffer || "unknown")}
             ${statCard("Max Leverage", pos.max_leverage ? `${escapeHtml(pos.max_leverage)}x` : "unknown")}
+            ${statCard("Setup Status", assessment?.alignment_status || "unknown")}
+            ${statCard("Event Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
+            ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
+            ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
           </div>
 
           <div class="scenario-grid">
@@ -1267,6 +1740,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-meta">Robust window: ${history?.long_horizon ? `${history.long_horizon.buckets} buckets x ${formatMaybe(history.long_horizon.bucket_minutes, 0)} min, ~${formatMaybe(history.long_horizon.approx_window_hours, 1)} h, latest ${history.long_horizon.latest_label || "unknown"}` : "building from rollups"}</div>
           <ul class="history-insights">${longInsights}</ul>
 
+          <div class="signal-note">Setup assessment is a conservative heuristic. It is not financial advice or an execution guarantee.</div>
+          <ul class="history-insights">${setupNotes}</ul>
+
           <div class="signal-note">Signals are heuristic summaries derived from Coinbase position, product, portfolio summary, and product book fields.</div>
           <ul class="signals">${signals}</ul>
         </article>
@@ -1276,6 +1752,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function render(snapshot) {
       latestSnapshot = snapshot;
       const first = snapshot.positions[0];
+      const firstSetup = first ? snapshot.setup_assessments?.[first.symbol] : null;
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
         metricCard("Positions", String(snapshot.positions.length)),
@@ -1286,16 +1763,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
           snapshot.portfolio?.id ? shortId(snapshot.portfolio.id) : ""
         ),
         metricCard("Credential Source", snapshot.credential_source || "unknown", "compact"),
-        metricCard("Primary Bias", first?.market_bias || "no position"),
-        metricCard("Primary Outlook", first?.position_outlook || "no position"),
+        metricCard("Setup Status", firstSetup?.alignment_status || "no position"),
+        metricCard("Event Risk", snapshot.market_context?.event_risk || "unknown"),
+        metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "unknown"),
       ].join("");
 
       const cards = document.getElementById("cards");
       if (!snapshot.positions.length) {
-        cards.innerHTML = `<div class="empty"><h2>No open positions</h2><div class="empty-copy">The dashboard is live, but Coinbase returned no open INTX perpetual positions.</div></div>`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">The dashboard is live, but Coinbase returned no open INTX perpetual positions.</div></div>`;
       } else {
-        cards.innerHTML = snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol])).join("");
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol])).join("")}`;
       }
     }
 
@@ -1366,8 +1844,15 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let portfolio = state.portfolio.clone();
 
-    match tokio::task::spawn_blocking(move || load_output(portfolio.as_deref())).await {
-        Ok(Ok(output)) => {
+    match tokio::task::spawn_blocking(move || -> Result<(Output, MarketContext)> {
+        let output = load_output(portfolio.as_deref())?;
+        let client = build_http_client()?;
+        let market_context = load_market_context(&client);
+        Ok((output, market_context))
+    })
+    .await
+    {
+        Ok(Ok((output, market_context))) => {
             let position_history = match state.history.lock() {
                 Ok(mut history) => {
                     let summaries = upsert_history(&mut history, &output);
@@ -1375,8 +1860,8 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to persist dashboard history: {error:#}"),
-                        )
-                            .into_response();
+                    )
+                        .into_response();
                     }
                     summaries
                 }
@@ -1388,10 +1873,23 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         .into_response()
                 }
             };
+            let setup_assessments = output
+                .positions
+                .iter()
+                .map(|position| {
+                    let history = position_history.get(&position.symbol);
+                    (
+                        position.symbol.clone(),
+                        assess_trade_setup(position, history, &market_context),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
 
             let payload = DashboardSnapshot {
                 output,
                 position_history,
+                market_context,
+                setup_assessments,
             };
             (StatusCode::OK, Json(payload)).into_response()
         }
