@@ -374,7 +374,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Open Interest", pos.open_interest || "unknown")}
             ${statCard("OI Notional", pos.open_interest_notional != null ? formatMaybe(pos.open_interest_notional, 2) : "unknown")}
             ${statCard("Position Share of OI", pos.position_share_of_open_interest_pct != null ? `${formatMaybe(pos.position_share_of_open_interest_pct, 2)}%` : "unknown")}
-            ${statCard("OI Context", pos.open_interest_context || "unknown")}
             ${statCard("Basis", formatPct(pos.basis_pct), toneClass(pos.basis_pct))}
             ${statCard("24h Change", formatPct(pos.price_change_24h_pct), toneClass(pos.price_change_24h_pct))}
             ${statCard("Liq Distance", formatPct(pos.distance_to_liquidation_pct))}

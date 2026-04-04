@@ -175,7 +175,6 @@ pub struct PositionSummary {
     pub open_interest: Option<String>,
     pub open_interest_notional: Option<f64>,
     pub position_share_of_open_interest_pct: Option<f64>,
-    pub open_interest_context: Option<String>,
     pub distance_to_liquidation_pct: Option<f64>,
     pub market_bias: String,
     pub position_outlook: String,
@@ -204,7 +203,6 @@ struct DerivedAnalytics {
     funding_intensity: Option<String>,
     open_interest_notional: Option<f64>,
     position_share_of_open_interest_pct: Option<f64>,
-    open_interest_context: Option<String>,
     distance_to_liquidation_pct: Option<f64>,
     market_bias: String,
     position_outlook: String,
@@ -654,21 +652,6 @@ fn classify_funding_intensity(funding_rate_pct: Option<f64>) -> Option<String> {
     Some(label.to_string())
 }
 
-fn classify_open_interest_context(position_share_pct: Option<f64>) -> Option<String> {
-    let share = position_share_pct?;
-    let label = if share < 0.10 {
-        "tiny relative to market"
-    } else if share < 1.0 {
-        "small relative to market"
-    } else if share < 5.0 {
-        "meaningful relative to market"
-    } else {
-        "large relative to market"
-    };
-
-    Some(label.to_string())
-}
-
 fn analyze_position(
     position: &RawPosition,
     product: Option<&ProductResponse>,
@@ -704,8 +687,6 @@ fn analyze_position(
     let position_share_of_open_interest_pct = contracts
         .zip(open_interest)
         .and_then(|(size, oi)| (oi != 0.0).then_some((size / oi) * 100.0));
-    let open_interest_context =
-        classify_open_interest_context(position_share_of_open_interest_pct);
 
     let price_vs_entry_pct = mark_price
         .zip(entry_price)
@@ -763,12 +744,7 @@ fn analyze_position(
         ));
     }
     if let Some(share) = position_share_of_open_interest_pct {
-        signals.push(format!(
-            "Your position is {share:.2}% of current open interest, which is {}.",
-            open_interest_context
-                .as_deref()
-                .unwrap_or("unclassified")
-        ));
+        signals.push(format!("Your position is {share:.2}% of current open interest."));
     }
 
     DerivedAnalytics {
@@ -782,7 +758,6 @@ fn analyze_position(
         funding_intensity,
         open_interest_notional,
         position_share_of_open_interest_pct,
-        open_interest_context,
         distance_to_liquidation_pct,
         market_bias,
         position_outlook,
@@ -832,7 +807,6 @@ fn summarize_position(
         open_interest: format_opt(product.and_then(product_open_interest), 2),
         open_interest_notional: analytics.open_interest_notional,
         position_share_of_open_interest_pct: analytics.position_share_of_open_interest_pct,
-        open_interest_context: analytics.open_interest_context,
         distance_to_liquidation_pct: analytics.distance_to_liquidation_pct,
         market_bias: analytics.market_bias,
         position_outlook: analytics.position_outlook,
@@ -927,7 +901,7 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
         position.liquidation_buffer.as_deref().unwrap_or("unknown"),
     ));
     lines.push(format!(
-        "   Market: 24h={} | basis={} | funding={} ({}, {}) | openInterest={} (~{} notional, {}) | maxLev={}x",
+        "   Market: 24h={} | basis={} | funding={} ({}, {}) | openInterest={} (~{} notional, your share {}%) | maxLev={}x",
         format_pct(position.price_change_24h_pct)
             .as_deref()
             .unwrap_or("unknown"),
@@ -948,10 +922,9 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
         format_opt(position.open_interest_notional, 2)
             .as_deref()
             .unwrap_or("unknown"),
-        position
-            .open_interest_context
+        format_opt(position.position_share_of_open_interest_pct, 2)
             .as_deref()
-            .unwrap_or("unclassified"),
+            .unwrap_or("unknown"),
         position.max_leverage.as_deref().unwrap_or("unknown"),
     ));
     lines.push(format!(

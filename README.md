@@ -119,7 +119,6 @@ The dashboard shows the same snapshot in a browser-friendly layout and polls the
 - `open interest` is the total number of open contracts in the market
 - `open interest notional` converts that contract count to quote notional at the current mark
 - `position share of open interest` shows how large your position is relative to the whole market
-- `open interest context` labels that share as `tiny relative to market`, `small relative to market`, `meaningful relative to market`, or `large relative to market`
 - `liqDistance` is the percentage move from the current mark to the estimated liquidation price
 - `market bias` and `position outlook` are heuristic labels derived from 24h price change, basis, funding, entry distance, and liquidation distance
 - `Projections` are simple mark-to-market PnL scenarios, not forecasts
@@ -141,12 +140,13 @@ Funding intensity thresholds in this tool are heuristic:
 - `large`: up to `0.10%`
 - `very large`: above `0.10%`
 
-Open-interest context in this tool is also heuristic and is based on your position share of current open interest:
+Open interest is intentionally kept more factual than interpretive. A single snapshot can tell you:
 
-- under `0.10%`: `tiny relative to market`
-- under `1%`: `small relative to market`
-- under `5%`: `meaningful relative to market`
-- `5%` or more: `large relative to market`
+- how many contracts are open
+- roughly how much quote notional that represents at the current mark
+- what share of that open interest your position represents
+
+Trend-style interpretations such as "build" or "unwind" require history, not one snapshot.
 
 ## What the tool does
 
