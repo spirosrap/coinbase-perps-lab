@@ -171,6 +171,7 @@ pub struct PositionSummary {
     pub basis_pct: Option<f64>,
     pub funding_rate_pct: Option<f64>,
     pub funding_direction: Option<String>,
+    pub funding_intensity: Option<String>,
     pub open_interest: Option<String>,
     pub distance_to_liquidation_pct: Option<f64>,
     pub market_bias: String,
@@ -197,6 +198,7 @@ struct DerivedAnalytics {
     basis_pct: Option<f64>,
     funding_rate_pct: Option<f64>,
     funding_direction: Option<String>,
+    funding_intensity: Option<String>,
     distance_to_liquidation_pct: Option<f64>,
     market_bias: String,
     position_outlook: String,
@@ -467,6 +469,7 @@ fn compute_market_bias(
     price_change_24h_pct: Option<f64>,
     basis_pct: Option<f64>,
     funding_rate_pct: Option<f64>,
+    funding_intensity: Option<&str>,
 ) -> (String, usize, i32, Vec<String>) {
     let mut score = 0i32;
     let mut observed = 0usize;
@@ -507,15 +510,20 @@ fn compute_market_bias(
         if funding >= 0.005 {
             score += 1;
             signals.push(format!(
-                "Funding is +{funding:.4}% per interval, which shows long-side demand."
+                "Funding is +{funding:.4}% per interval, which shows long-side demand ({})",
+                funding_intensity.unwrap_or("unclassified")
             ));
         } else if funding <= -0.005 {
             score -= 1;
             signals.push(format!(
-                "Funding is {funding:.4}% per interval, which shows short-side demand."
+                "Funding is {funding:.4}% per interval, which shows short-side demand ({})",
+                funding_intensity.unwrap_or("unclassified")
             ));
         } else {
-            signals.push(format!("Funding is near neutral at {funding:.4}% per interval."));
+            signals.push(format!(
+                "Funding is near neutral at {funding:.4}% per interval ({})",
+                funding_intensity.unwrap_or("unclassified")
+            ));
         }
     }
 
@@ -621,6 +629,25 @@ fn compute_projections(
     }
 }
 
+fn classify_funding_intensity(funding_rate_pct: Option<f64>) -> Option<String> {
+    let abs_rate = funding_rate_pct.map(f64::abs)?;
+    let label = if abs_rate < 0.0005 {
+        "near zero"
+    } else if abs_rate <= 0.005 {
+        "tiny"
+    } else if abs_rate <= 0.02 {
+        "noticeable"
+    } else if abs_rate <= 0.05 {
+        "elevated"
+    } else if abs_rate <= 0.10 {
+        "large"
+    } else {
+        "very large"
+    };
+
+    Some(label.to_string())
+}
+
 fn analyze_position(
     position: &RawPosition,
     product: Option<&ProductResponse>,
@@ -650,6 +677,7 @@ fn analyze_position(
             "neutral funding".to_string()
         }
     });
+    let funding_intensity = classify_funding_intensity(funding_rate_pct);
 
     let price_vs_entry_pct = mark_price
         .zip(entry_price)
@@ -677,7 +705,12 @@ fn analyze_position(
     });
 
     let (market_bias, observed_bias_inputs, bias_score, mut bias_signals) =
-        compute_market_bias(price_change_24h_pct, basis_pct, funding_rate_pct);
+        compute_market_bias(
+            price_change_24h_pct,
+            basis_pct,
+            funding_rate_pct,
+            funding_intensity.as_deref(),
+        );
     let (position_outlook, outlook_confidence, mut outlook_signals) = compute_outlook(
         side.as_deref(),
         price_vs_entry_pct,
@@ -705,6 +738,7 @@ fn analyze_position(
         basis_pct,
         funding_rate_pct,
         funding_direction,
+        funding_intensity,
         distance_to_liquidation_pct,
         market_bias,
         position_outlook,
@@ -750,6 +784,7 @@ fn summarize_position(
         basis_pct: analytics.basis_pct,
         funding_rate_pct: analytics.funding_rate_pct,
         funding_direction: analytics.funding_direction,
+        funding_intensity: analytics.funding_intensity,
         open_interest: format_opt(product.and_then(product_open_interest), 2),
         distance_to_liquidation_pct: analytics.distance_to_liquidation_pct,
         market_bias: analytics.market_bias,
@@ -845,7 +880,7 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
         position.liquidation_buffer.as_deref().unwrap_or("unknown"),
     ));
     lines.push(format!(
-        "   Market: 24h={} | basis={} | funding={} ({}) | openInterest={} | maxLev={}x",
+        "   Market: 24h={} | basis={} | funding={} ({}, {}) | openInterest={} | maxLev={}x",
         format_pct(position.price_change_24h_pct)
             .as_deref()
             .unwrap_or("unknown"),
@@ -858,6 +893,10 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
             .funding_direction
             .as_deref()
             .unwrap_or("unknown funding"),
+        position
+            .funding_intensity
+            .as_deref()
+            .unwrap_or("unclassified"),
         position.open_interest.as_deref().unwrap_or("unknown"),
         position.max_leverage.as_deref().unwrap_or("unknown"),
     ));

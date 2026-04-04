@@ -115,6 +115,7 @@ The dashboard shows the same snapshot in a browser-friendly layout and polls the
 - `effectiveLev` is computed from `position_notional / collateral`, which is often the more useful risk number
 - `basis` is the percentage difference between perp mark and index price
 - `funding` is shown per funding interval, with a direction label to indicate which side is paying
+- `funding intensity` classifies the size of the funding rate: `near zero`, `tiny`, `noticeable`, `elevated`, `large`, or `very large`
 - `liqDistance` is the percentage move from the current mark to the estimated liquidation price
 - `market bias` and `position outlook` are heuristic labels derived from 24h price change, basis, funding, entry distance, and liquidation distance
 - `Projections` are simple mark-to-market PnL scenarios, not forecasts
@@ -126,6 +127,15 @@ Projections: +1%=3.07 | +3%=9.20 | -1%=-3.07 | -3%=-9.20
 ```
 
 This means: if the current mark moves up `1%`, the position's unrealized PnL would increase by about `3.07` quote units; if it moves down `3%`, unrealized PnL would decrease by about `9.20`. These projections do not include fees, funding, slippage, or execution effects.
+
+Funding intensity thresholds in this tool are heuristic:
+
+- `near zero`: under `0.0005%`
+- `tiny`: up to `0.005%`
+- `noticeable`: up to `0.02%`
+- `elevated`: up to `0.05%`
+- `large`: up to `0.10%`
+- `very large`: above `0.10%`
 
 ## What the tool does
 

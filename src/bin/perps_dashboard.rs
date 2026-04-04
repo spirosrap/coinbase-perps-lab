@@ -370,7 +370,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Effective Lev", pos.effective_leverage != null ? `${formatMaybe(pos.effective_leverage, 2)}x` : "unknown")}
             ${statCard("API Lev", pos.api_leverage ? `${escapeHtml(pos.api_leverage)}x` : "unknown")}
             ${statCard("Funding", pos.funding_rate_pct != null ? `${formatMaybe(pos.funding_rate_pct, 4)}%` : "unknown", toneClass(pos.funding_rate_pct))}
-            ${statCard("Funding Direction", pos.funding_direction || "unknown")}
+            ${statCard("Funding Context", pos.funding_direction && pos.funding_intensity ? `${pos.funding_direction} (${pos.funding_intensity})` : (pos.funding_direction || pos.funding_intensity || "unknown"))}
             ${statCard("Basis", formatPct(pos.basis_pct), toneClass(pos.basis_pct))}
             ${statCard("24h Change", formatPct(pos.price_change_24h_pct), toneClass(pos.price_change_24h_pct))}
             ${statCard("Liq Distance", formatPct(pos.distance_to_liquidation_pct))}
