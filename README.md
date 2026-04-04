@@ -126,6 +126,11 @@ If you leave the dashboard running, it also builds a rolling in-memory microstru
 
 By default, that history is also persisted locally to `.local/perps_dashboard_history.json`, so it survives dashboard restarts.
 
+The dashboard now keeps two time horizons:
+
+- recent raw history: up to `240` high-resolution samples at the normal refresh interval
+- long-horizon rollups: `5` minute buckets, retained for up to `14` days
+
 ## Interpreting the Rust output
 
 - `apiLev` is the raw leverage field returned by Coinbase's position endpoint
@@ -178,6 +183,7 @@ The dashboard history panels build from these same live snapshots. They are inte
 - if you restart the dashboard, history resumes from the last saved local state file
 - if Coinbase returns the same book timestamp repeatedly, the server treats that as the same sample and updates it in place
 - the default persistence path is `.local/perps_dashboard_history.json`, and you can override it with `--history-file`
+- long-horizon robustness comes from persisted `5` minute rollups, so you can compare current spread, imbalance, and `$40k` sweep costs against a broader baseline
 
 Funding intensity thresholds in this tool are heuristic:
 
@@ -206,6 +212,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 6. Computes derived analytics and renders them in either CLI or dashboard form
 7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
 8. Persists that dashboard history to a local JSON file so it survives restarts
+9. Maintains longer-horizon `5` minute rollups so the dashboard can compare current microstructure against a broader recent baseline
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 
@@ -218,7 +225,7 @@ The dashboard uses the same Rust analysis path. Coinbase credentials stay in the
 - Both Rust binaries are read-only and target the same INTX portfolio/positions workflow
 - The analytics layer is shared between the CLI and dashboard
 - The heuristic analytics are context, not a predictive trading model
-- The dashboard is local-only by default, uses the same read-only Rust snapshot pipeline, and stores rolling history in a local JSON file
+- The dashboard is local-only by default, uses the same read-only Rust snapshot pipeline, stores rolling history in a local JSON file, and derives longer-horizon `5` minute rollups from those persisted samples
 
 ## Security
 

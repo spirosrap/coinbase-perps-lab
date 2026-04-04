@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HISTORY_POINTS: usize = 240;
+const ROLLUP_BUCKET_MS: u64 = 5 * 60 * 1000;
+const MAX_ROLLUP_BUCKETS: usize = 14 * 24 * 12;
+const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 
 #[derive(Parser, Debug)]
@@ -42,7 +45,7 @@ struct AppState {
     portfolio: Option<String>,
     refresh_ms: u64,
     history_file: PathBuf,
-    history: Mutex<HashMap<String, Vec<PositionHistorySample>>>,
+    history: Mutex<HashMap<String, PersistedSymbolHistory>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +62,55 @@ struct PositionHistorySample {
     sell_40k_bps: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedSymbolHistory {
+    #[serde(default)]
+    recent: Vec<PositionHistorySample>,
+    #[serde(default)]
+    rollups: Vec<HistoryRollupBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryRollupBucket {
+    bucket_start_ms: u64,
+    label: String,
+    sample_count: usize,
+    spread_bps: RunningMetric,
+    top_5_imbalance_pct: RunningMetric,
+    buy_10k_bps: RunningMetric,
+    buy_40k_bps: RunningMetric,
+    sell_10k_bps: RunningMetric,
+    sell_40k_bps: RunningMetric,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RunningMetric {
+    sum: f64,
+    count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedHistory {
     #[serde(default = "history_format_version")]
     version: u32,
     #[serde(default)]
-    symbols: HashMap<String, Vec<PositionHistorySample>>,
+    symbols: HashMap<String, PersistedSymbolHistory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedHistoryCompat {
+    #[serde(default = "history_format_version")]
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    symbols: HashMap<String, PersistedSymbolHistoryCompatEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedSymbolHistoryCompatEntry {
+    Legacy(Vec<PositionHistorySample>),
+    Current(PersistedSymbolHistory),
 }
 
 #[derive(Debug, Serialize)]
@@ -86,25 +132,40 @@ struct PositionHistorySummary {
     buy_40k_bps: Option<MetricHistorySummary>,
     sell_10k_bps: Option<MetricHistorySummary>,
     sell_40k_bps: Option<MetricHistorySummary>,
+    long_horizon: Option<LongHorizonSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct LongHorizonSummary {
+    buckets: usize,
+    bucket_minutes: f64,
+    approx_window_hours: f64,
+    latest_label: Option<String>,
+    insights: Vec<String>,
+    spread_bps: Option<MetricHistorySummary>,
+    top_5_imbalance_pct: Option<MetricHistorySummary>,
+    buy_40k_bps: Option<MetricHistorySummary>,
+    sell_40k_bps: Option<MetricHistorySummary>,
 }
 
 #[derive(Debug, Serialize)]
 struct MetricHistorySummary {
     current: f64,
+    average: f64,
     min: f64,
     max: f64,
     delta_from_oldest: f64,
     points: Vec<MetricPoint>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MetricPoint {
     label: String,
     value: f64,
 }
 
 fn history_format_version() -> u32 {
-    1
+    2
 }
 
 fn now_millis() -> u64 {
@@ -114,31 +175,132 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn trim_history(history: &mut HashMap<String, Vec<PositionHistorySample>>) {
-    for samples in history.values_mut() {
-        if samples.len() > MAX_HISTORY_POINTS {
-            let overflow = samples.len() - MAX_HISTORY_POINTS;
-            samples.drain(0..overflow);
+fn trim_history(history: &mut HashMap<String, PersistedSymbolHistory>) {
+    for symbol_history in history.values_mut() {
+        if symbol_history.recent.len() > MAX_HISTORY_POINTS {
+            let overflow = symbol_history.recent.len() - MAX_HISTORY_POINTS;
+            symbol_history.recent.drain(0..overflow);
+        }
+        if symbol_history.rollups.len() > MAX_ROLLUP_BUCKETS {
+            let overflow = symbol_history.rollups.len() - MAX_ROLLUP_BUCKETS;
+            symbol_history.rollups.drain(0..overflow);
         }
     }
 }
 
-fn load_history_file(path: &PathBuf) -> Result<HashMap<String, Vec<PositionHistorySample>>> {
+impl RunningMetric {
+    fn push(&mut self, value: Option<f64>) {
+        if let Some(value) = value {
+            self.sum += value;
+            self.count += 1;
+        }
+    }
+
+    fn average(&self) -> Option<f64> {
+        (self.count > 0).then_some(self.sum / self.count as f64)
+    }
+}
+
+fn rollup_label(sample: &PositionHistorySample) -> String {
+    let iso = sample.id.as_str();
+    if iso.len() >= 16 && iso.as_bytes().get(10) == Some(&b'T') {
+        format!("{} {}", &iso[..10], &iso[11..16])
+    } else {
+        sample.label.clone()
+    }
+}
+
+fn bucket_start_ms(recorded_at_ms: u64) -> u64 {
+    recorded_at_ms - (recorded_at_ms % ROLLUP_BUCKET_MS)
+}
+
+fn push_sample_into_rollups(rollups: &mut Vec<HistoryRollupBucket>, sample: &PositionHistorySample) {
+    let bucket_start = bucket_start_ms(sample.recorded_at_ms);
+    if rollups
+        .last()
+        .map(|bucket| bucket.bucket_start_ms == bucket_start)
+        .unwrap_or(false)
+    {
+        if let Some(bucket) = rollups.last_mut() {
+            bucket.sample_count += 1;
+            bucket.spread_bps.push(sample.spread_bps);
+            bucket.top_5_imbalance_pct.push(sample.top_5_imbalance_pct);
+            bucket.buy_10k_bps.push(sample.buy_10k_bps);
+            bucket.buy_40k_bps.push(sample.buy_40k_bps);
+            bucket.sell_10k_bps.push(sample.sell_10k_bps);
+            bucket.sell_40k_bps.push(sample.sell_40k_bps);
+        }
+        return;
+    }
+
+    let mut bucket = HistoryRollupBucket {
+        bucket_start_ms: bucket_start,
+        label: rollup_label(sample),
+        sample_count: 0,
+        spread_bps: RunningMetric::default(),
+        top_5_imbalance_pct: RunningMetric::default(),
+        buy_10k_bps: RunningMetric::default(),
+        buy_40k_bps: RunningMetric::default(),
+        sell_10k_bps: RunningMetric::default(),
+        sell_40k_bps: RunningMetric::default(),
+    };
+    bucket.sample_count += 1;
+    bucket.spread_bps.push(sample.spread_bps);
+    bucket.top_5_imbalance_pct.push(sample.top_5_imbalance_pct);
+    bucket.buy_10k_bps.push(sample.buy_10k_bps);
+    bucket.buy_40k_bps.push(sample.buy_40k_bps);
+    bucket.sell_10k_bps.push(sample.sell_10k_bps);
+    bucket.sell_40k_bps.push(sample.sell_40k_bps);
+    rollups.push(bucket);
+}
+
+fn rebuild_rollups(samples: &[PositionHistorySample]) -> Vec<HistoryRollupBucket> {
+    let mut rollups = Vec::new();
+    for sample in samples {
+        push_sample_into_rollups(&mut rollups, sample);
+    }
+    if rollups.len() > MAX_ROLLUP_BUCKETS {
+        let overflow = rollups.len() - MAX_ROLLUP_BUCKETS;
+        rollups.drain(0..overflow);
+    }
+    rollups
+}
+
+fn load_history_file(path: &PathBuf) -> Result<HashMap<String, PersistedSymbolHistory>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
 
     let raw = fs::read(path)
         .with_context(|| format!("failed to read history file {}", path.display()))?;
-    let mut persisted: PersistedHistory = serde_json::from_slice(&raw)
+    let compat: PersistedHistoryCompat = serde_json::from_slice(&raw)
         .with_context(|| format!("failed to parse history file {}", path.display()))?;
-    trim_history(&mut persisted.symbols);
-    Ok(persisted.symbols)
+    let mut symbols = compat
+        .symbols
+        .into_iter()
+        .map(|(symbol, entry)| {
+            let history = match entry {
+                PersistedSymbolHistoryCompatEntry::Legacy(recent) => PersistedSymbolHistory {
+                    rollups: rebuild_rollups(&recent),
+                    recent,
+                },
+                PersistedSymbolHistoryCompatEntry::Current(mut current) => {
+                    if current.rollups.is_empty() && !current.recent.is_empty() {
+                        current.rollups = rebuild_rollups(&current.recent);
+                    }
+                    current
+                }
+            };
+            (symbol, history)
+        })
+        .collect::<HashMap<_, _>>();
+    trim_history(&mut symbols);
+    Ok(symbols)
 }
 
 fn save_history_file(
     path: &PathBuf,
-    history: &HashMap<String, Vec<PositionHistorySample>>,
+    history: &HashMap<String, PersistedSymbolHistory>,
 ) -> Result<()> {
     let persisted = PersistedHistory {
         version: history_format_version(),
@@ -212,7 +374,7 @@ fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
 }
 
 fn upsert_history(
-    history: &mut HashMap<String, Vec<PositionHistorySample>>,
+    history: &mut HashMap<String, PersistedSymbolHistory>,
     output: &Output,
 ) -> HashMap<String, PositionHistorySummary> {
     for position in &output.positions {
@@ -220,33 +382,67 @@ fn upsert_history(
             continue;
         };
 
-        let series = history.entry(position.symbol.clone()).or_default();
-        if series
+        let symbol_history = history.entry(position.symbol.clone()).or_default();
+        if symbol_history
+            .recent
             .last()
             .map(|existing| existing.id == sample.id)
             .unwrap_or(false)
         {
-            if let Some(last) = series.last_mut() {
+            if let Some(last) = symbol_history.recent.last_mut() {
                 *last = sample;
             }
         } else {
-            series.push(sample);
+            symbol_history.recent.push(sample.clone());
+            push_sample_into_rollups(&mut symbol_history.rollups, &sample);
         }
     }
     trim_history(history);
 
     history
         .iter()
-        .map(|(symbol, samples)| {
-            (
-                symbol.clone(),
-                summarize_position_history(samples),
-            )
+        .map(|(symbol, history)| (symbol.clone(), summarize_position_history(history)))
+        .collect()
+}
+
+fn downsample_points(points: Vec<MetricPoint>, max_points: usize) -> Vec<MetricPoint> {
+    if points.len() <= max_points || max_points == 0 {
+        return points;
+    }
+
+    let step = (points.len() - 1) as f64 / (max_points - 1) as f64;
+    (0..max_points)
+        .filter_map(|index| {
+            let point_index = (index as f64 * step).round() as usize;
+            points.get(point_index).cloned()
         })
         .collect()
 }
 
-fn metric_summary<F>(
+fn metric_summary(points: Vec<MetricPoint>) -> Option<MetricHistorySummary> {
+    let first = points.first()?;
+    let current = points.last()?.value;
+    let min = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f64::INFINITY, f64::min);
+    let max = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let average = points.iter().map(|point| point.value).sum::<f64>() / points.len() as f64;
+
+    Some(MetricHistorySummary {
+        current,
+        average,
+        min,
+        max,
+        delta_from_oldest: current - first.value,
+        points: downsample_points(points, MAX_POINTS_PER_SERIES),
+    })
+}
+
+fn raw_metric_summary<F>(
     samples: &[PositionHistorySample],
     extractor: F,
 ) -> Option<MetricHistorySummary>
@@ -260,34 +456,118 @@ where
             value,
         }))
         .collect::<Vec<_>>();
+    metric_summary(points)
+}
 
-    let first = points.first()?;
-    let current = points.last()?.value;
-    let min = points
+fn rollup_metric_summary<F>(
+    rollups: &[HistoryRollupBucket],
+    extractor: F,
+) -> Option<MetricHistorySummary>
+where
+    F: Fn(&HistoryRollupBucket) -> Option<f64>,
+{
+    let points = rollups
         .iter()
-        .map(|point| point.value)
-        .fold(f64::INFINITY, f64::min);
-    let max = points
-        .iter()
-        .map(|point| point.value)
-        .fold(f64::NEG_INFINITY, f64::max);
+        .filter_map(|bucket| extractor(bucket).map(|value| MetricPoint {
+            label: bucket.label.clone(),
+            value,
+        }))
+        .collect::<Vec<_>>();
+    metric_summary(points)
+}
 
-    Some(MetricHistorySummary {
-        current,
-        min,
-        max,
-        delta_from_oldest: current - first.value,
-        points,
+fn summarize_long_horizon(history: &PersistedSymbolHistory) -> Option<LongHorizonSummary> {
+    if history.rollups.is_empty() {
+        return None;
+    }
+
+    let spread_bps = rollup_metric_summary(&history.rollups, |bucket| bucket.spread_bps.average());
+    let top_5_imbalance_pct =
+        rollup_metric_summary(&history.rollups, |bucket| bucket.top_5_imbalance_pct.average());
+    let buy_40k_bps = rollup_metric_summary(&history.rollups, |bucket| bucket.buy_40k_bps.average());
+    let sell_40k_bps =
+        rollup_metric_summary(&history.rollups, |bucket| bucket.sell_40k_bps.average());
+
+    let mut insights = Vec::new();
+    if let Some(spread) = spread_bps.as_ref() {
+        if spread.current > spread.average + 1.5 {
+            insights.push(format!(
+                "Spread is currently {delta:.2} bps wider than the long-horizon average.",
+                delta = spread.current - spread.average
+            ));
+        } else if spread.current < spread.average - 1.5 {
+            insights.push(format!(
+                "Spread is currently {delta:.2} bps tighter than the long-horizon average.",
+                delta = spread.average - spread.current
+            ));
+        }
+    }
+    if let Some(imbalance) = top_5_imbalance_pct.as_ref() {
+        if imbalance.current <= -15.0 && imbalance.average <= -10.0 {
+            insights.push(format!(
+                "Ask-heavy depth is persistent: current {current:.2}% vs long-horizon average {average:.2}%.",
+                current = imbalance.current,
+                average = imbalance.average
+            ));
+        } else if imbalance.current >= 15.0 && imbalance.average >= 10.0 {
+            insights.push(format!(
+                "Bid-heavy depth is persistent: current {current:.2}% vs long-horizon average {average:.2}%.",
+                current = imbalance.current,
+                average = imbalance.average
+            ));
+        }
+    }
+    if let (Some(buy), Some(sell)) = (buy_40k_bps.as_ref(), sell_40k_bps.as_ref()) {
+        let current_gap = buy.current - sell.current;
+        let average_gap = buy.average - sell.average;
+        if current_gap >= 5.0 && average_gap >= 3.0 {
+            insights.push(format!(
+                "Upward aggression remains more expensive than selling: current $40k buy/sell gap {current_gap:.2} bps, long-horizon average gap {average_gap:.2} bps."
+            ));
+        } else if current_gap <= -5.0 && average_gap <= -3.0 {
+            insights.push(format!(
+                "Downward aggression remains more expensive than buying: current $40k sell/buy gap {gap:.2} bps in favor of the offer side.",
+                gap = current_gap.abs()
+            ));
+        }
+    }
+    if insights.is_empty() {
+        insights.push(
+            "Long-horizon rollups are still building. Leave the dashboard running across more sessions for stronger persistence tests."
+                .to_string(),
+        );
+    }
+
+    Some(LongHorizonSummary {
+        buckets: history.rollups.len(),
+        bucket_minutes: ROLLUP_BUCKET_MS as f64 / 60_000.0,
+        approx_window_hours: history
+            .rollups
+            .first()
+            .zip(history.rollups.last())
+            .map(|(first, last)| {
+                last.bucket_start_ms
+                    .saturating_sub(first.bucket_start_ms) as f64
+                    / 3_600_000.0
+            })
+            .unwrap_or(0.0),
+        latest_label: history.rollups.last().map(|bucket| bucket.label.clone()),
+        insights,
+        spread_bps,
+        top_5_imbalance_pct,
+        buy_40k_bps,
+        sell_40k_bps,
     })
 }
 
-fn summarize_position_history(samples: &[PositionHistorySample]) -> PositionHistorySummary {
-    let spread_bps = metric_summary(samples, |sample| sample.spread_bps);
-    let top_5_imbalance_pct = metric_summary(samples, |sample| sample.top_5_imbalance_pct);
-    let buy_10k_bps = metric_summary(samples, |sample| sample.buy_10k_bps);
-    let buy_40k_bps = metric_summary(samples, |sample| sample.buy_40k_bps);
-    let sell_10k_bps = metric_summary(samples, |sample| sample.sell_10k_bps);
-    let sell_40k_bps = metric_summary(samples, |sample| sample.sell_40k_bps);
+fn summarize_position_history(history: &PersistedSymbolHistory) -> PositionHistorySummary {
+    let spread_bps = raw_metric_summary(&history.recent, |sample| sample.spread_bps);
+    let top_5_imbalance_pct =
+        raw_metric_summary(&history.recent, |sample| sample.top_5_imbalance_pct);
+    let buy_10k_bps = raw_metric_summary(&history.recent, |sample| sample.buy_10k_bps);
+    let buy_40k_bps = raw_metric_summary(&history.recent, |sample| sample.buy_40k_bps);
+    let sell_10k_bps = raw_metric_summary(&history.recent, |sample| sample.sell_10k_bps);
+    let sell_40k_bps = raw_metric_summary(&history.recent, |sample| sample.sell_40k_bps);
 
     let mut insights = Vec::new();
     if let Some(spread) = spread_bps.as_ref() {
@@ -350,13 +630,18 @@ fn summarize_position_history(samples: &[PositionHistorySample]) -> PositionHist
     }
 
     PositionHistorySummary {
-        samples: samples.len(),
-        approx_window_minutes: samples
+        samples: history.recent.len(),
+        approx_window_minutes: history
+            .recent
             .first()
-            .zip(samples.last())
-            .map(|(first, last)| last.recorded_at_ms.saturating_sub(first.recorded_at_ms) as f64 / 60_000.0)
+            .zip(history.recent.last())
+            .map(|(first, last)| {
+                last.recorded_at_ms
+                    .saturating_sub(first.recorded_at_ms) as f64
+                    / 60_000.0
+            })
             .unwrap_or(0.0),
-        latest_label: samples.last().map(|sample| sample.label.clone()),
+        latest_label: history.recent.last().map(|sample| sample.label.clone()),
         insights,
         spread_bps,
         top_5_imbalance_pct,
@@ -364,6 +649,7 @@ fn summarize_position_history(samples: &[PositionHistorySample]) -> PositionHist
         buy_40k_bps,
         sell_10k_bps,
         sell_40k_bps,
+        long_horizon: summarize_long_horizon(history),
     }
 }
 
@@ -829,6 +1115,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-value">${escapeHtml(formatMetric(summary.current, suffix, digits))}</div>
           ${sparkline(summary.points)}
           <div class="history-range">Range ${escapeHtml(formatMetric(summary.min, suffix, digits))} to ${escapeHtml(formatMetric(summary.max, suffix, digits))}</div>
+          <div class="history-meta">Average ${escapeHtml(formatMetric(summary.average, suffix, digits))}</div>
           <div class="history-meta">Delta vs oldest ${escapeHtml(formatSigned(summary.delta_from_oldest, digits))}${escapeHtml(suffix)}</div>
         </section>
       `;
@@ -870,6 +1157,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const historyInsights = (history?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const longInsights = (history?.long_horizon?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const spreadValue = pos.order_book?.spread_absolute != null || pos.order_book?.spread_bps != null
         ? `${formatMaybe(pos.order_book?.spread_absolute, 4)} | ${formatBps(pos.order_book?.spread_bps)}`
         : "unknown";
@@ -940,6 +1228,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
           <div class="history-meta">History window: ${history ? `${history.samples} samples, ~${formatMaybe(history.approx_window_minutes, 1)} min, latest ${history.latest_label || "unknown"}` : "building from the first snapshot"}</div>
           <ul class="history-insights">${historyInsights}</ul>
+
+          <div class="history-grid">
+            ${historyPanel("Long Spread Trend", history?.long_horizon?.spread_bps, " bps", 2)}
+            ${historyPanel("Long Imbalance Trend", history?.long_horizon?.top_5_imbalance_pct, "%", 2)}
+            ${historyPanel("Long Buy $40k Slip", history?.long_horizon?.buy_40k_bps, " bps", 2)}
+            ${historyPanel("Long Sell $40k Slip", history?.long_horizon?.sell_40k_bps, " bps", 2)}
+          </div>
+
+          <div class="history-meta">Robust window: ${history?.long_horizon ? `${history.long_horizon.buckets} buckets x ${formatMaybe(history.long_horizon.bucket_minutes, 0)} min, ~${formatMaybe(history.long_horizon.approx_window_hours, 1)} h, latest ${history.long_horizon.latest_label || "unknown"}` : "building from rollups"}</div>
+          <ul class="history-insights">${longInsights}</ul>
 
           <div class="signal-note">Signals are heuristic summaries derived from Coinbase position, product, portfolio summary, and product book fields.</div>
           <ul class="signals">${signals}</ul>
