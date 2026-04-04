@@ -371,13 +371,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("API Lev", pos.api_leverage ? `${escapeHtml(pos.api_leverage)}x` : "unknown")}
             ${statCard("Funding", pos.funding_rate_pct != null ? `${formatMaybe(pos.funding_rate_pct, 4)}%` : "unknown", toneClass(pos.funding_rate_pct))}
             ${statCard("Funding Context", pos.funding_direction && pos.funding_intensity ? `${pos.funding_direction} (${pos.funding_intensity})` : (pos.funding_direction || pos.funding_intensity || "unknown"))}
+            ${statCard("Open Interest", pos.open_interest || "unknown")}
+            ${statCard("OI Notional", pos.open_interest_notional != null ? formatMaybe(pos.open_interest_notional, 2) : "unknown")}
+            ${statCard("Position Share of OI", pos.position_share_of_open_interest_pct != null ? `${formatMaybe(pos.position_share_of_open_interest_pct, 2)}%` : "unknown")}
+            ${statCard("OI Context", pos.open_interest_context || "unknown")}
             ${statCard("Basis", formatPct(pos.basis_pct), toneClass(pos.basis_pct))}
             ${statCard("24h Change", formatPct(pos.price_change_24h_pct), toneClass(pos.price_change_24h_pct))}
             ${statCard("Liq Distance", formatPct(pos.distance_to_liquidation_pct))}
             ${statCard("Liq Price", pos.liquidation_price || "unknown")}
             ${statCard("Collateral", pos.collateral || "unknown")}
             ${statCard("Liq Buffer", pos.liquidation_buffer || "unknown")}
-            ${statCard("Open Interest", pos.open_interest || "unknown")}
             ${statCard("Max Leverage", pos.max_leverage ? `${escapeHtml(pos.max_leverage)}x` : "unknown")}
           </div>
 
