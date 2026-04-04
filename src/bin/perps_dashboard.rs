@@ -6,12 +6,16 @@ use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
 use coinbase_perps_lab::{load_output, OrderBookSummary, Output, PositionSummary, SlippageEstimate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HISTORY_POINTS: usize = 240;
+const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -26,24 +30,41 @@ struct Args {
         help = "Browser refresh interval in seconds for polling live data"
     )]
     refresh_seconds: u64,
+    #[arg(
+        long,
+        default_value = DEFAULT_HISTORY_FILE,
+        help = "Path to the local JSON file used to persist dashboard history"
+    )]
+    history_file: PathBuf,
 }
 
 struct AppState {
     portfolio: Option<String>,
     refresh_ms: u64,
+    history_file: PathBuf,
     history: Mutex<HashMap<String, Vec<PositionHistorySample>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PositionHistorySample {
     id: String,
     label: String,
+    #[serde(default)]
+    recorded_at_ms: u64,
     spread_bps: Option<f64>,
     top_5_imbalance_pct: Option<f64>,
     buy_10k_bps: Option<f64>,
     buy_40k_bps: Option<f64>,
     sell_10k_bps: Option<f64>,
     sell_40k_bps: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedHistory {
+    #[serde(default = "history_format_version")]
+    version: u32,
+    #[serde(default)]
+    symbols: HashMap<String, Vec<PositionHistorySample>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +103,75 @@ struct MetricPoint {
     value: f64,
 }
 
+fn history_format_version() -> u32 {
+    1
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn trim_history(history: &mut HashMap<String, Vec<PositionHistorySample>>) {
+    for samples in history.values_mut() {
+        if samples.len() > MAX_HISTORY_POINTS {
+            let overflow = samples.len() - MAX_HISTORY_POINTS;
+            samples.drain(0..overflow);
+        }
+    }
+}
+
+fn load_history_file(path: &PathBuf) -> Result<HashMap<String, Vec<PositionHistorySample>>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let raw = fs::read(path)
+        .with_context(|| format!("failed to read history file {}", path.display()))?;
+    let mut persisted: PersistedHistory = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse history file {}", path.display()))?;
+    trim_history(&mut persisted.symbols);
+    Ok(persisted.symbols)
+}
+
+fn save_history_file(
+    path: &PathBuf,
+    history: &HashMap<String, Vec<PositionHistorySample>>,
+) -> Result<()> {
+    let persisted = PersistedHistory {
+        version: history_format_version(),
+        symbols: history.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&persisted).context("failed to encode history JSON")?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create history directory {}", parent.display())
+        })?;
+    }
+
+    let mut temp_path = path.clone();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{value}.tmp"))
+        .unwrap_or_else(|| "tmp".to_string());
+    temp_path.set_extension(extension);
+
+    fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write history temp file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to atomically replace history file {}",
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 fn find_slippage_bps(estimates: &[SlippageEstimate], target_quote: f64) -> Option<f64> {
     estimates
         .iter()
@@ -111,6 +201,7 @@ fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
     Some(PositionHistorySample {
         id: sample_id(Some(book)),
         label: sample_label(Some(book)),
+        recorded_at_ms: now_millis(),
         spread_bps: book.spread_bps,
         top_5_imbalance_pct: book.top_5_imbalance_pct,
         buy_10k_bps: find_slippage_bps(&book.buy_slippage, 10_000.0),
@@ -123,7 +214,6 @@ fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
 fn upsert_history(
     history: &mut HashMap<String, Vec<PositionHistorySample>>,
     output: &Output,
-    refresh_ms: u64,
 ) -> HashMap<String, PositionHistorySummary> {
     for position in &output.positions {
         let Some(sample) = history_sample(position) else {
@@ -141,19 +231,16 @@ fn upsert_history(
             }
         } else {
             series.push(sample);
-            if series.len() > MAX_HISTORY_POINTS {
-                let overflow = series.len() - MAX_HISTORY_POINTS;
-                series.drain(0..overflow);
-            }
         }
     }
+    trim_history(history);
 
     history
         .iter()
         .map(|(symbol, samples)| {
             (
                 symbol.clone(),
-                summarize_position_history(samples, refresh_ms),
+                summarize_position_history(samples),
             )
         })
         .collect()
@@ -194,7 +281,7 @@ where
     })
 }
 
-fn summarize_position_history(samples: &[PositionHistorySample], refresh_ms: u64) -> PositionHistorySummary {
+fn summarize_position_history(samples: &[PositionHistorySample]) -> PositionHistorySummary {
     let spread_bps = metric_summary(samples, |sample| sample.spread_bps);
     let top_5_imbalance_pct = metric_summary(samples, |sample| sample.top_5_imbalance_pct);
     let buy_10k_bps = metric_summary(samples, |sample| sample.buy_10k_bps);
@@ -264,7 +351,11 @@ fn summarize_position_history(samples: &[PositionHistorySample], refresh_ms: u64
 
     PositionHistorySummary {
         samples: samples.len(),
-        approx_window_minutes: ((samples.len().saturating_sub(1)) as f64 * refresh_ms as f64) / 60_000.0,
+        approx_window_minutes: samples
+            .first()
+            .zip(samples.last())
+            .map(|(first, last)| last.recorded_at_ms.saturating_sub(first.recorded_at_ms) as f64 / 60_000.0)
+            .unwrap_or(0.0),
         latest_label: samples.last().map(|sample| sample.label.clone()),
         insights,
         spread_bps,
@@ -943,12 +1034,21 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let portfolio = state.portfolio.clone();
-    let refresh_ms = state.refresh_ms;
 
     match tokio::task::spawn_blocking(move || load_output(portfolio.as_deref())).await {
         Ok(Ok(output)) => {
             let position_history = match state.history.lock() {
-                Ok(mut history) => upsert_history(&mut history, &output, refresh_ms),
+                Ok(mut history) => {
+                    let summaries = upsert_history(&mut history, &output);
+                    if let Err(error) = save_history_file(&state.history_file, &history) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to persist dashboard history: {error:#}"),
+                        )
+                            .into_response();
+                    }
+                    summaries
+                }
                 Err(_) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -989,10 +1089,12 @@ fn escape_html_text(input: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let history = load_history_file(&args.history_file)?;
     let state = Arc::new(AppState {
         portfolio: args.portfolio,
         refresh_ms: args.refresh_seconds.saturating_mul(1000),
-        history: Mutex::new(HashMap::new()),
+        history_file: args.history_file,
+        history: Mutex::new(history),
     });
 
     let app = Router::new()

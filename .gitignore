@@ -3,5 +3,6 @@
 !.env.example
 .venv/
 target/
+.local/
 __pycache__/
 .DS_Store

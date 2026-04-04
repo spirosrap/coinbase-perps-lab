@@ -96,6 +96,12 @@ Dashboard with a custom bind address or explicit portfolio UUID:
 cargo run --bin perps_dashboard -- --bind 127.0.0.1:3000 --portfolio YOUR_INTX_PORTFOLIO_UUID
 ```
 
+Dashboard with an explicit persistent history file path:
+
+```bash
+cargo run --bin perps_dashboard -- --history-file .local/perps_dashboard_history.json
+```
+
 The Rust output now includes additional derived context per position:
 
 - effective leverage from portfolio collateral, alongside the raw API leverage field
@@ -117,6 +123,8 @@ If you leave the dashboard running, it also builds a rolling in-memory microstru
 - top-5 bid/ask depth imbalance over time
 - buy and sell slippage for `$10k` and `$40k` quote notionals over time
 - whether sweep costs are recovering after a thinner patch of liquidity
+
+By default, that history is also persisted locally to `.local/perps_dashboard_history.json`, so it survives dashboard restarts.
 
 ## Interpreting the Rust output
 
@@ -164,11 +172,12 @@ This means:
 
 The dashboard history panels build from these same live snapshots. They are intentionally local and rolling:
 
-- history starts when you open the dashboard
-- history is kept in memory by the Rust server
+- history starts when you open the dashboard, or resumes from the local history file if one already exists
+- history is kept in memory by the Rust server and also written to a local JSON file
 - history is bounded to a recent rolling window, not a permanent time series database
-- if you restart the dashboard, the history resets
+- if you restart the dashboard, history resumes from the last saved local state file
 - if Coinbase returns the same book timestamp repeatedly, the server treats that as the same sample and updates it in place
+- the default persistence path is `.local/perps_dashboard_history.json`, and you can override it with `--history-file`
 
 Funding intensity thresholds in this tool are heuristic:
 
@@ -196,6 +205,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 5. Fetches open positions, product metadata, portfolio summary data, and the live product-book ladder
 6. Computes derived analytics and renders them in either CLI or dashboard form
 7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
+8. Persists that dashboard history to a local JSON file so it survives restarts
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 
@@ -208,12 +218,13 @@ The dashboard uses the same Rust analysis path. Coinbase credentials stay in the
 - Both Rust binaries are read-only and target the same INTX portfolio/positions workflow
 - The analytics layer is shared between the CLI and dashboard
 - The heuristic analytics are context, not a predictive trading model
-- The dashboard is local-only by default and uses the same read-only Rust snapshot pipeline
+- The dashboard is local-only by default, uses the same read-only Rust snapshot pipeline, and stores rolling history in a local JSON file
 
 ## Security
 
 - `.env` is ignored by git and should never be committed
 - `target/` is ignored by git
+- `.local/` is ignored by git and stores local dashboard state such as persistent microstructure history
 - `.env.example` contains placeholders only
 - Use the least-privileged Coinbase credentials available for your workflow
 
