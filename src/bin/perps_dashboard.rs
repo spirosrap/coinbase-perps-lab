@@ -751,17 +751,38 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .metric {
       padding: 16px 18px;
+      min-height: 168px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
     }
     .metric-label {
       font-size: 0.8rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
       margin-bottom: 8px;
+      line-height: 1.22;
+      min-height: 2.2em;
+      display: flex;
+      align-items: flex-start;
     }
     .metric-value {
-      font-size: 1.45rem;
+      font-size: clamp(1.18rem, 2.1vw, 1.65rem);
       font-weight: 720;
-      line-height: 1.1;
+      line-height: 1.05;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .metric-value.compact {
+      font-size: clamp(1.05rem, 1.7vw, 1.35rem);
+      line-height: 1.12;
+    }
+    .metric-note {
+      margin-top: auto;
+      padding-top: 12px;
+      font-size: 0.86rem;
+      color: var(--muted);
+      overflow-wrap: anywhere;
     }
     .cards {
       margin-top: 18px;
@@ -1064,8 +1085,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return "neutral";
     }
 
-    function metricCard(label, value, extraClass = "") {
-      return `<article class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value ${extraClass}">${escapeHtml(value)}</div></article>`;
+    function shortId(value, head = 8, tail = 6) {
+      const text = String(value ?? "");
+      if (text.length <= head + tail + 3) return text;
+      return `${text.slice(0, head)}...${text.slice(-tail)}`;
+    }
+
+    function metricCard(label, value, extraClass = "", note = "") {
+      const noteHtml = note ? `<div class="metric-note">${escapeHtml(note)}</div>` : "";
+      return `<article class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value ${extraClass}">${escapeHtml(value)}</div>${noteHtml}</article>`;
     }
 
     function statCard(label, value, extraClass = "") {
@@ -1251,8 +1279,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
         metricCard("Positions", String(snapshot.positions.length)),
-        metricCard("Portfolio", snapshot.portfolio?.portfolio_type ? `${snapshot.portfolio.id} (${snapshot.portfolio.portfolio_type})` : "unknown"),
-        metricCard("Credential Source", snapshot.credential_source || "unknown"),
+        metricCard(
+          "Portfolio",
+          snapshot.portfolio?.portfolio_type || "unknown",
+          "",
+          snapshot.portfolio?.id ? shortId(snapshot.portfolio.id) : ""
+        ),
+        metricCard("Credential Source", snapshot.credential_source || "unknown", "compact"),
         metricCard("Primary Bias", first?.market_bias || "no position"),
         metricCard("Primary Outlook", first?.position_outlook || "no position"),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "unknown"),
