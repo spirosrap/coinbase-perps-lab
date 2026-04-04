@@ -5,9 +5,13 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
-use coinbase_perps_lab::load_output;
+use coinbase_perps_lab::{load_output, OrderBookSummary, Output, PositionSummary, SlippageEstimate};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+const MAX_HISTORY_POINTS: usize = 240;
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -24,10 +28,252 @@ struct Args {
     refresh_seconds: u64,
 }
 
-#[derive(Clone)]
 struct AppState {
     portfolio: Option<String>,
     refresh_ms: u64,
+    history: Mutex<HashMap<String, Vec<PositionHistorySample>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PositionHistorySample {
+    id: String,
+    label: String,
+    spread_bps: Option<f64>,
+    top_5_imbalance_pct: Option<f64>,
+    buy_10k_bps: Option<f64>,
+    buy_40k_bps: Option<f64>,
+    sell_10k_bps: Option<f64>,
+    sell_40k_bps: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardSnapshot {
+    #[serde(flatten)]
+    output: Output,
+    position_history: HashMap<String, PositionHistorySummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct PositionHistorySummary {
+    samples: usize,
+    approx_window_minutes: f64,
+    latest_label: Option<String>,
+    insights: Vec<String>,
+    spread_bps: Option<MetricHistorySummary>,
+    top_5_imbalance_pct: Option<MetricHistorySummary>,
+    buy_10k_bps: Option<MetricHistorySummary>,
+    buy_40k_bps: Option<MetricHistorySummary>,
+    sell_10k_bps: Option<MetricHistorySummary>,
+    sell_40k_bps: Option<MetricHistorySummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricHistorySummary {
+    current: f64,
+    min: f64,
+    max: f64,
+    delta_from_oldest: f64,
+    points: Vec<MetricPoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricPoint {
+    label: String,
+    value: f64,
+}
+
+fn find_slippage_bps(estimates: &[SlippageEstimate], target_quote: f64) -> Option<f64> {
+    estimates
+        .iter()
+        .find(|estimate| (estimate.quote_notional - target_quote).abs() < 0.5)
+        .and_then(|estimate| estimate.slippage_bps)
+}
+
+fn sample_label(book: Option<&OrderBookSummary>) -> String {
+    let raw = book
+        .and_then(|order_book| order_book.book_time.as_deref())
+        .unwrap_or("unknown");
+
+    raw.split('T')
+        .nth(1)
+        .and_then(|tail| tail.split('.').next())
+        .unwrap_or(raw)
+        .to_string()
+}
+
+fn sample_id(book: Option<&OrderBookSummary>) -> String {
+    book.and_then(|order_book| order_book.book_time.clone())
+        .unwrap_or_else(|| sample_label(book))
+}
+
+fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
+    let book = position.order_book.as_ref()?;
+    Some(PositionHistorySample {
+        id: sample_id(Some(book)),
+        label: sample_label(Some(book)),
+        spread_bps: book.spread_bps,
+        top_5_imbalance_pct: book.top_5_imbalance_pct,
+        buy_10k_bps: find_slippage_bps(&book.buy_slippage, 10_000.0),
+        buy_40k_bps: find_slippage_bps(&book.buy_slippage, 40_000.0),
+        sell_10k_bps: find_slippage_bps(&book.sell_slippage, 10_000.0),
+        sell_40k_bps: find_slippage_bps(&book.sell_slippage, 40_000.0),
+    })
+}
+
+fn upsert_history(
+    history: &mut HashMap<String, Vec<PositionHistorySample>>,
+    output: &Output,
+    refresh_ms: u64,
+) -> HashMap<String, PositionHistorySummary> {
+    for position in &output.positions {
+        let Some(sample) = history_sample(position) else {
+            continue;
+        };
+
+        let series = history.entry(position.symbol.clone()).or_default();
+        if series
+            .last()
+            .map(|existing| existing.id == sample.id)
+            .unwrap_or(false)
+        {
+            if let Some(last) = series.last_mut() {
+                *last = sample;
+            }
+        } else {
+            series.push(sample);
+            if series.len() > MAX_HISTORY_POINTS {
+                let overflow = series.len() - MAX_HISTORY_POINTS;
+                series.drain(0..overflow);
+            }
+        }
+    }
+
+    history
+        .iter()
+        .map(|(symbol, samples)| {
+            (
+                symbol.clone(),
+                summarize_position_history(samples, refresh_ms),
+            )
+        })
+        .collect()
+}
+
+fn metric_summary<F>(
+    samples: &[PositionHistorySample],
+    extractor: F,
+) -> Option<MetricHistorySummary>
+where
+    F: Fn(&PositionHistorySample) -> Option<f64>,
+{
+    let points = samples
+        .iter()
+        .filter_map(|sample| extractor(sample).map(|value| MetricPoint {
+            label: sample.label.clone(),
+            value,
+        }))
+        .collect::<Vec<_>>();
+
+    let first = points.first()?;
+    let current = points.last()?.value;
+    let min = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f64::INFINITY, f64::min);
+    let max = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    Some(MetricHistorySummary {
+        current,
+        min,
+        max,
+        delta_from_oldest: current - first.value,
+        points,
+    })
+}
+
+fn summarize_position_history(samples: &[PositionHistorySample], refresh_ms: u64) -> PositionHistorySummary {
+    let spread_bps = metric_summary(samples, |sample| sample.spread_bps);
+    let top_5_imbalance_pct = metric_summary(samples, |sample| sample.top_5_imbalance_pct);
+    let buy_10k_bps = metric_summary(samples, |sample| sample.buy_10k_bps);
+    let buy_40k_bps = metric_summary(samples, |sample| sample.buy_40k_bps);
+    let sell_10k_bps = metric_summary(samples, |sample| sample.sell_10k_bps);
+    let sell_40k_bps = metric_summary(samples, |sample| sample.sell_40k_bps);
+
+    let mut insights = Vec::new();
+    if let Some(spread) = spread_bps.as_ref() {
+        let tightening = spread.max - spread.current;
+        if tightening >= 2.0 {
+            insights.push(format!(
+                "Spread has tightened by {tightening:.2} bps from the widest level in the current window."
+            ));
+        } else if spread.current - spread.min >= 2.0 {
+            insights.push(format!(
+                "Spread is {delta:.2} bps wider than the tightest level in the current window.",
+                delta = spread.current - spread.min
+            ));
+        }
+    }
+    if let Some(buy_40k) = buy_40k_bps.as_ref() {
+        let recovery = buy_40k.max - buy_40k.current;
+        if recovery >= 5.0 {
+            insights.push(format!(
+                "Buy-side depth recovered by {recovery:.2} bps versus the worst $40k sweep cost in the current window."
+            ));
+        } else if buy_40k.current - buy_40k.min >= 5.0 {
+            insights.push(format!(
+                "Buy-side depth is {delta:.2} bps thinner than the best $40k sweep cost in the current window.",
+                delta = buy_40k.current - buy_40k.min
+            ));
+        }
+    }
+    if let Some(sell_40k) = sell_40k_bps.as_ref() {
+        let recovery = sell_40k.max - sell_40k.current;
+        if recovery >= 5.0 {
+            insights.push(format!(
+                "Sell-side depth recovered by {recovery:.2} bps versus the worst $40k sweep cost in the current window."
+            ));
+        } else if sell_40k.current - sell_40k.min >= 5.0 {
+            insights.push(format!(
+                "Sell-side depth is {delta:.2} bps thinner than the best $40k sweep cost in the current window.",
+                delta = sell_40k.current - sell_40k.min
+            ));
+        }
+    }
+    if let Some(imbalance) = top_5_imbalance_pct.as_ref() {
+        if imbalance.current >= 15.0 {
+            insights.push(format!(
+                "Top-5 depth is currently bid-heavy by {value:.2}%.",
+                value = imbalance.current
+            ));
+        } else if imbalance.current <= -15.0 {
+            insights.push(format!(
+                "Top-5 depth is currently ask-heavy by {value:.2}%.",
+                value = imbalance.current.abs()
+            ));
+        }
+    }
+    if insights.is_empty() {
+        insights.push(
+            "History is still building. Leave the dashboard running to compare spread, imbalance, and sweep costs over time."
+                .to_string(),
+        );
+    }
+
+    PositionHistorySummary {
+        samples: samples.len(),
+        approx_window_minutes: ((samples.len().saturating_sub(1)) as f64 * refresh_ms as f64) / 60_000.0,
+        latest_label: samples.last().map(|sample| sample.label.clone()),
+        insights,
+        spread_bps,
+        top_5_imbalance_pct,
+        buy_10k_bps,
+        buy_40k_bps,
+        sell_10k_bps,
+        sell_40k_bps,
+    }
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -112,7 +358,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: rgba(29, 35, 43, 0.08);
       color: var(--ink);
     }
-    .hero-grid, .stats-grid, .scenario-grid, .execution-grid {
+    .hero-grid, .stats-grid, .scenario-grid, .execution-grid, .history-grid {
       display: grid;
       gap: 14px;
     }
@@ -212,11 +458,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       margin: 16px 0;
     }
+    .history-grid {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin: 16px 0;
+    }
     .execution-panel {
       border: 1px solid var(--line);
       border-radius: 20px;
       background: var(--panel-strong);
       padding: 16px;
+    }
+    .history-panel {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--panel-strong);
+      padding: 16px;
+      min-height: 190px;
     }
     .section-title {
       font-size: 0.82rem;
@@ -224,6 +481,40 @@ const INDEX_HTML: &str = r#"<!doctype html>
       letter-spacing: 0.09em;
       color: var(--muted);
       margin: 4px 0 10px;
+    }
+    .history-value {
+      font-size: 1.5rem;
+      font-weight: 760;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+    .history-range {
+      font-size: 0.92rem;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .sparkline {
+      width: 100%;
+      height: 68px;
+      display: block;
+      margin-bottom: 10px;
+    }
+    .sparkline polyline {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 2.4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .chart-placeholder {
+      height: 68px;
+      display: grid;
+      place-items: center;
+      border-radius: 14px;
+      background: rgba(29, 35, 43, 0.04);
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 10px;
     }
     .execution-panel .scenario-grid {
       margin: 0;
@@ -235,6 +526,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin-top: 8px;
       font-size: 0.92rem;
       color: var(--muted);
+    }
+    .history-meta {
+      margin-top: 4px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .history-insights {
+      margin-top: 10px;
+      padding-left: 18px;
+    }
+    .history-insights li {
+      margin-bottom: 8px;
+      line-height: 1.4;
     }
     .scenario {
       padding: 16px;
@@ -359,6 +663,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `${prefix}${num.toFixed(digits)}`;
     }
 
+    function formatMetric(value, suffix = "", digits = 2) {
+      if (value === null || value === undefined) return "unknown";
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "unknown";
+      return `${num.toFixed(digits)}${suffix}`;
+    }
+
     function toneClass(value) {
       if (value === null || value === undefined) return "neutral-text";
       const num = Number(value);
@@ -386,6 +697,50 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     function scenarioCard(label, value) {
       return `<div class="scenario"><div class="stat-label">${escapeHtml(label)}</div><div class="scenario-value ${toneClass(value)}">${escapeHtml(formatSigned(value, 2))}</div></div>`;
+    }
+
+    function sparkline(points) {
+      const values = (points || [])
+        .map((point) => Number(point?.value))
+        .filter((value) => Number.isFinite(value));
+      if (values.length < 2) {
+        return `<div class="chart-placeholder">Need more samples</div>`;
+      }
+
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || 1;
+      const coords = values
+        .map((value, index) => {
+          const x = (index / (values.length - 1)) * 100;
+          const y = 100 - ((value - min) / span) * 100;
+          return `${x.toFixed(2)},${y.toFixed(2)}`;
+        })
+        .join(" ");
+
+      return `<svg viewBox="0 0 100 100" preserveAspectRatio="none" class="sparkline" aria-hidden="true"><polyline points="${coords}" /></svg>`;
+    }
+
+    function historyPanel(label, summary, suffix = "", digits = 2) {
+      if (!summary) {
+        return `
+          <section class="history-panel">
+            <div class="section-title">${escapeHtml(label)}</div>
+            <div class="chart-placeholder">No history yet</div>
+            <div class="history-meta">Leave the dashboard open to build this series.</div>
+          </section>
+        `;
+      }
+
+      return `
+        <section class="history-panel">
+          <div class="section-title">${escapeHtml(label)}</div>
+          <div class="history-value">${escapeHtml(formatMetric(summary.current, suffix, digits))}</div>
+          ${sparkline(summary.points)}
+          <div class="history-range">Range ${escapeHtml(formatMetric(summary.min, suffix, digits))} to ${escapeHtml(formatMetric(summary.max, suffix, digits))}</div>
+          <div class="history-meta">Delta vs oldest ${escapeHtml(formatSigned(summary.delta_from_oldest, digits))}${escapeHtml(suffix)}</div>
+        </section>
+      `;
     }
 
     function slippageCard(estimate, sideLabel) {
@@ -420,9 +775,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function positionCard(pos) {
+    function positionCard(pos, history) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const historyInsights = (history?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const spreadValue = pos.order_book?.spread_absolute != null || pos.order_book?.spread_bps != null
         ? `${formatMaybe(pos.order_book?.spread_absolute, 4)} | ${formatBps(pos.order_book?.spread_bps)}`
         : "unknown";
@@ -458,6 +814,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Best Ask", pos.order_book?.best_ask != null ? formatMaybe(pos.order_book.best_ask, 2) : "unknown")}
             ${statCard("Spread", spreadValue)}
             ${statCard("Book Levels", pos.order_book ? `${pos.order_book.bid_levels}/${pos.order_book.ask_levels}` : "unknown")}
+            ${statCard("Top 5 Bid Depth", pos.order_book?.top_5_bid_notional != null ? formatMaybe(pos.order_book.top_5_bid_notional, 0) : "unknown")}
+            ${statCard("Top 5 Ask Depth", pos.order_book?.top_5_ask_notional != null ? formatMaybe(pos.order_book.top_5_ask_notional, 0) : "unknown")}
+            ${statCard("Top 5 Imbalance", pos.order_book?.top_5_imbalance_pct != null ? formatPct(pos.order_book.top_5_imbalance_pct) : "unknown", toneClass(pos.order_book?.top_5_imbalance_pct))}
             ${statCard("Basis", formatPct(pos.basis_pct), toneClass(pos.basis_pct))}
             ${statCard("24h Change", formatPct(pos.price_change_24h_pct), toneClass(pos.price_change_24h_pct))}
             ${statCard("Liq Distance", formatPct(pos.distance_to_liquidation_pct))}
@@ -478,6 +837,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${executionPanel("Buy Slippage vs Best Ask", pos.order_book?.buy_slippage, "buy")}
             ${executionPanel("Sell Slippage vs Best Bid", pos.order_book?.sell_slippage, "sell")}
           </div>
+
+          <div class="history-grid">
+            ${historyPanel("Spread History", history?.spread_bps, " bps", 2)}
+            ${historyPanel("Top 5 Imbalance History", history?.top_5_imbalance_pct, "%", 2)}
+            ${historyPanel("Buy $10k Slip History", history?.buy_10k_bps, " bps", 2)}
+            ${historyPanel("Buy $40k Slip History", history?.buy_40k_bps, " bps", 2)}
+            ${historyPanel("Sell $10k Slip History", history?.sell_10k_bps, " bps", 2)}
+            ${historyPanel("Sell $40k Slip History", history?.sell_40k_bps, " bps", 2)}
+          </div>
+
+          <div class="history-meta">History window: ${history ? `${history.samples} samples, ~${formatMaybe(history.approx_window_minutes, 1)} min, latest ${history.latest_label || "unknown"}` : "building from the first snapshot"}</div>
+          <ul class="history-insights">${historyInsights}</ul>
 
           <div class="signal-note">Signals are heuristic summaries derived from Coinbase position, product, portfolio summary, and product book fields.</div>
           <ul class="signals">${signals}</ul>
@@ -502,7 +873,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (!snapshot.positions.length) {
         cards.innerHTML = `<div class="empty"><h2>No open positions</h2><div class="empty-copy">The dashboard is live, but Coinbase returned no open INTX perpetual positions.</div></div>`;
       } else {
-        cards.innerHTML = snapshot.positions.map(positionCard).join("");
+        cards.innerHTML = snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol])).join("");
       }
     }
 
@@ -572,9 +943,27 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let portfolio = state.portfolio.clone();
+    let refresh_ms = state.refresh_ms;
 
     match tokio::task::spawn_blocking(move || load_output(portfolio.as_deref())).await {
-        Ok(Ok(output)) => (StatusCode::OK, Json(output)).into_response(),
+        Ok(Ok(output)) => {
+            let position_history = match state.history.lock() {
+                Ok(mut history) => upsert_history(&mut history, &output, refresh_ms),
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Dashboard history lock is poisoned".to_string(),
+                    )
+                        .into_response()
+                }
+            };
+
+            let payload = DashboardSnapshot {
+                output,
+                position_history,
+            };
+            (StatusCode::OK, Json(payload)).into_response()
+        }
         Ok(Err(error)) => (
             StatusCode::BAD_GATEWAY,
             format!("Failed to load Coinbase snapshot: {error:#}"),
@@ -603,6 +992,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         portfolio: args.portfolio,
         refresh_ms: args.refresh_seconds.saturating_mul(1000),
+        history: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()

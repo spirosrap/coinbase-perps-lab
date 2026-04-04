@@ -233,6 +233,11 @@ pub struct OrderBookSummary {
     pub book_time: Option<String>,
     pub bid_levels: usize,
     pub ask_levels: usize,
+    pub visible_bid_notional: Option<f64>,
+    pub visible_ask_notional: Option<f64>,
+    pub top_5_bid_notional: Option<f64>,
+    pub top_5_ask_notional: Option<f64>,
+    pub top_5_imbalance_pct: Option<f64>,
     pub buy_slippage: Vec<SlippageEstimate>,
     pub sell_slippage: Vec<SlippageEstimate>,
 }
@@ -526,6 +531,19 @@ fn parse_book_levels(levels: &[BookLevel]) -> Vec<ParsedBookLevel> {
         .collect()
 }
 
+fn sum_quote_depth(levels: &[ParsedBookLevel], limit: Option<usize>) -> Option<f64> {
+    let iter = match limit {
+        Some(level_limit) => levels.iter().take(level_limit).collect::<Vec<_>>(),
+        None => levels.iter().collect::<Vec<_>>(),
+    };
+
+    if iter.is_empty() {
+        return None;
+    }
+
+    Some(iter.into_iter().map(|level| level.price * level.size).sum())
+}
+
 fn estimate_quote_execution(
     levels: &[ParsedBookLevel],
     target_quote: f64,
@@ -600,6 +618,16 @@ fn build_order_book_summary(book: &ProductBookResponse) -> Option<OrderBookSumma
             (mid > 0.0).then_some((spread / mid) * 10_000.0)
         })
     });
+    let visible_bid_notional = sum_quote_depth(&bids, None);
+    let visible_ask_notional = sum_quote_depth(&asks, None);
+    let top_5_bid_notional = sum_quote_depth(&bids, Some(5));
+    let top_5_ask_notional = sum_quote_depth(&asks, Some(5));
+    let top_5_imbalance_pct = top_5_bid_notional
+        .zip(top_5_ask_notional)
+        .and_then(|(bid, ask)| {
+            let total = bid + ask;
+            (total > 0.0).then_some(((bid - ask) / total) * 100.0)
+        });
 
     let buy_slippage = SLIPPAGE_NOTIONAL_TARGETS
         .iter()
@@ -619,6 +647,11 @@ fn build_order_book_summary(book: &ProductBookResponse) -> Option<OrderBookSumma
         book_time: book.pricebook.time.clone(),
         bid_levels: bids.len(),
         ask_levels: asks.len(),
+        visible_bid_notional,
+        visible_ask_notional,
+        top_5_bid_notional,
+        top_5_ask_notional,
+        top_5_imbalance_pct,
         buy_slippage,
         sell_slippage,
     })
@@ -970,6 +1003,18 @@ fn analyze_position(
                 "Top-of-book spread is {spread_bps:.2} bps ({spread_absolute} absolute)."
             ));
         }
+        if let Some(imbalance) = book.top_5_imbalance_pct {
+            let lean = if imbalance > 5.0 {
+                "bid-heavy"
+            } else if imbalance < -5.0 {
+                "ask-heavy"
+            } else {
+                "balanced"
+            };
+            signals.push(format!(
+                "Near-touch depth imbalance across the top 5 levels is {imbalance:.2}% ({lean})."
+            ));
+        }
 
         let buy_10k = book
             .buy_slippage
@@ -1248,7 +1293,7 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
     ));
     if let Some(book) = position.order_book.as_ref() {
         lines.push(format!(
-            "   Execution: bestBid={} | bestAsk={} | spread={} ({} bps) | bookLevels={}/{}",
+            "   Execution: bestBid={} | bestAsk={} | spread={} ({} bps) | bookLevels={}/{} | top5Depth={}/{} | imbalance={}",
             format_opt(book.best_bid, 2).as_deref().unwrap_or("unknown"),
             format_opt(book.best_ask, 2).as_deref().unwrap_or("unknown"),
             format_opt(book.spread_absolute, 4)
@@ -1257,6 +1302,15 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
             format_opt(book.spread_bps, 2).as_deref().unwrap_or("unknown"),
             book.bid_levels,
             book.ask_levels,
+            format_opt(book.top_5_bid_notional, 0)
+                .as_deref()
+                .unwrap_or("unknown"),
+            format_opt(book.top_5_ask_notional, 0)
+                .as_deref()
+                .unwrap_or("unknown"),
+            format_pct(book.top_5_imbalance_pct)
+                .as_deref()
+                .unwrap_or("unknown"),
         ));
         lines.push(format!(
             "   Buy slip: {}",

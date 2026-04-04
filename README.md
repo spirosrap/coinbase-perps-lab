@@ -111,6 +111,13 @@ The Rust output now includes additional derived context per position:
 
 The dashboard shows the same snapshot in a browser-friendly layout and polls the local backend for refreshes.
 
+If you leave the dashboard running, it also builds a rolling in-memory microstructure history per symbol so you can compare:
+
+- spread stability over time
+- top-5 bid/ask depth imbalance over time
+- buy and sell slippage for `$10k` and `$40k` quote notionals over time
+- whether sweep costs are recovering after a thinner patch of liquidity
+
 ## Interpreting the Rust output
 
 - `apiLev` is the raw leverage field returned by Coinbase's position endpoint
@@ -123,6 +130,8 @@ The dashboard shows the same snapshot in a browser-friendly layout and polls the
 - `position share of open interest` shows how large your position is relative to the whole market
 - `best bid` and `best ask` are the current top-of-book prices from Coinbase's product book
 - `spread` is the current top-of-book gap between best bid and best ask, shown in absolute terms and basis points
+- `top 5 bid depth` and `top 5 ask depth` convert the first five levels on each side into quote notional
+- `top 5 imbalance` compares those top-five quote notionals as `(bid depth - ask depth) / total depth`
 - `buy slip` and `sell slip` estimate market-order impact for preset quote notionals (`$5k`, `$10k`, `$20k`, `$40k`)
 - slippage is measured against the current best ask for buys and the current best bid for sells, so it reflects incremental execution cost beyond the top level
 - `liqDistance` is the percentage move from the current mark to the estimated liquidation price
@@ -153,6 +162,14 @@ This means:
 - selling larger size walks down the bid ladder, so average execution price gets worse
 - these are snapshot estimates, not guarantees; they can change before execution
 
+The dashboard history panels build from these same live snapshots. They are intentionally local and rolling:
+
+- history starts when you open the dashboard
+- history is kept in memory by the Rust server
+- history is bounded to a recent rolling window, not a permanent time series database
+- if you restart the dashboard, the history resets
+- if Coinbase returns the same book timestamp repeatedly, the server treats that as the same sample and updates it in place
+
 Funding intensity thresholds in this tool are heuristic:
 
 - `near zero`: under `0.0005%`
@@ -178,6 +195,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 4. Selects the first `INTX` portfolio unless you pass `--portfolio`
 5. Fetches open positions, product metadata, portfolio summary data, and the live product-book ladder
 6. Computes derived analytics and renders them in either CLI or dashboard form
+7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 
