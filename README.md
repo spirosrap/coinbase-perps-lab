@@ -7,7 +7,7 @@ Small CCXT-based lab for inspecting Coinbase INTX perpetual positions from a loc
 - Creates an isolated local Python environment in `.venv`
 - Loads Coinbase credentials from `.env`
 - Uses `ccxt` to discover your INTX portfolio and list open perpetual positions
-- Includes a direct Rust implementation for the same read-only workflow
+- Includes a direct Rust implementation for the same read-only workflow plus derived market/risk analytics
 - Keeps secrets out of git with `.gitignore`
 
 ## Requirements
@@ -119,6 +119,35 @@ Rust with an explicit portfolio UUID:
 cargo run --bin discover_perp_positions_rust -- --portfolio YOUR_INTX_PORTFOLIO_UUID
 ```
 
+The Rust output now includes additional derived context per position:
+
+- effective leverage from portfolio collateral, alongside the raw API leverage field
+- mark vs index basis
+- 24h price change
+- funding rate and funding direction
+- liquidation distance and liquidation buffer
+- open interest and max leverage
+- heuristic market bias and position outlook labels
+- simple scenario projections for `+1%`, `+3%`, `-1%`, and `-3%` moves from the current mark
+
+## Interpreting the Rust output
+
+- `apiLev` is the raw leverage field returned by Coinbase's position endpoint
+- `effectiveLev` is computed from `position_notional / collateral`, which is often the more useful risk number
+- `basis` is the percentage difference between perp mark and index price
+- `funding` is shown per funding interval, with a direction label to indicate which side is paying
+- `liqDistance` is the percentage move from the current mark to the estimated liquidation price
+- `market bias` and `position outlook` are heuristic labels derived from 24h price change, basis, funding, entry distance, and liquidation distance
+- `Projections` are simple mark-to-market PnL scenarios, not forecasts
+
+Example:
+
+```text
+Projections: +1%=3.07 | +3%=9.20 | -1%=-3.07 | -3%=-9.20
+```
+
+This means: if the current mark moves up `1%`, the position's unrealized PnL would increase by about `3.07` quote units; if it moves down `3%`, unrealized PnL would decrease by about `9.20`. These projections do not include fees, funding, slippage, or execution effects.
+
 ## What the script does
 
 1. Loads variables from `.env`
@@ -127,7 +156,7 @@ cargo run --bin discover_perp_positions_rust -- --portfolio YOUR_INTX_PORTFOLIO_
 4. Selects the first `INTX` portfolio unless you pass `--portfolio`
 5. Fetches open positions for that portfolio
 
-The Rust binary follows the same flow, but it calls Coinbase's REST API directly instead of using CCXT.
+The Rust binary follows the same flow, but it calls Coinbase's REST API directly instead of using CCXT. It also enriches the raw position snapshot with product metadata and portfolio summary data so the output can show additional context without placing trades.
 
 ## Python vs Rust
 
@@ -135,6 +164,7 @@ The Rust binary follows the same flow, but it calls Coinbase's REST API directly
 - Official CCXT does not currently ship a Rust implementation
 - The Rust binary uses direct Coinbase REST calls with ES256 JWT authentication
 - Both tools are read-only and target the same INTX portfolio/positions workflow
+- The Rust tool adds heuristic analytics for context, but it is not a predictive trading model
 
 ## Security
 

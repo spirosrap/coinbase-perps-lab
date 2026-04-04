@@ -11,6 +11,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ const API_HOST: &str = "api.coinbase.com";
 const API_BASE: &str = "https://api.coinbase.com";
 
 #[derive(Parser, Debug)]
-#[command(about = "Discover open Coinbase INTX perpetual positions without CCXT.")]
+#[command(about = "Discover open Coinbase INTX perpetual positions with derived market/risk context.")]
 struct Args {
     #[arg(long, help = "Optional explicit INTX portfolio UUID")]
     portfolio: Option<String>,
@@ -47,9 +48,11 @@ struct Portfolio {
     deleted: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Money {
     value: String,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,30 +62,76 @@ struct PositionsResponse {
 
 #[derive(Debug, Deserialize)]
 struct RawPosition {
+    portfolio_uuid: Option<String>,
     symbol: String,
+    vwap: Option<Money>,
+    entry_vwap: Option<Money>,
+    mark_price: Option<Money>,
+    unrealized_pnl: Option<Money>,
+    aggregated_pnl: Option<Money>,
+    liquidation_price: Option<Money>,
+    position_notional: Option<Money>,
     position_side: Option<String>,
     margin_type: Option<String>,
     net_size: Option<String>,
     leverage: Option<String>,
-    mark_price: Option<Money>,
-    unrealized_pnl: Option<Money>,
-    liquidation_price: Option<Money>,
-    position_notional: Option<Money>,
-    entry_vwap: Option<Money>,
 }
 
-#[derive(Debug, Serialize)]
-struct PositionSummary {
-    symbol: String,
-    side: Option<String>,
-    contracts: Option<String>,
-    notional: Option<String>,
-    entry_price: Option<String>,
-    mark_price: Option<String>,
-    unrealized_pnl: Option<String>,
-    liquidation_price: Option<String>,
-    leverage: Option<String>,
-    margin_mode: Option<String>,
+#[derive(Debug, Deserialize)]
+struct ProductResponse {
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    price_percentage_change_24h: Option<String>,
+    #[serde(default)]
+    future_product_details: Option<FutureProductDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FutureProductDetails {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    contract_display_name: Option<String>,
+    #[serde(default)]
+    index_price: Option<String>,
+    #[serde(default)]
+    funding_rate: Option<String>,
+    #[serde(default)]
+    open_interest: Option<String>,
+    #[serde(default)]
+    max_leverage: Option<String>,
+    #[serde(default)]
+    perpetual_details: Option<PerpetualDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerpetualDetails {
+    #[serde(default)]
+    open_interest: Option<String>,
+    #[serde(default)]
+    funding_rate: Option<String>,
+    #[serde(default)]
+    max_leverage: Option<String>,
+    #[serde(default)]
+    underlying_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntxPortfolioSummaryResponse {
+    portfolios: Vec<IntxPortfolioState>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct IntxPortfolioState {
+    portfolio_uuid: String,
+    collateral: String,
+    position_notional: String,
+    pending_fees: String,
+    portfolio_initial_margin: String,
+    portfolio_maintenance_margin: String,
+    liquidation_buffer: String,
+    total_balance: Money,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +139,7 @@ struct Output {
     credential_source: String,
     portfolio: PortfolioSummary,
     portfolio_count: usize,
+    analysis_basis: &'static str,
     positions: Vec<PositionSummary>,
 }
 
@@ -97,6 +147,70 @@ struct Output {
 struct PortfolioSummary {
     id: String,
     portfolio_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PositionSummary {
+    symbol: String,
+    display_name: Option<String>,
+    underlying_type: Option<String>,
+    side: Option<String>,
+    contracts: Option<String>,
+    notional: Option<String>,
+    entry_price: Option<String>,
+    mark_price: Option<String>,
+    index_price: Option<String>,
+    vwap_price: Option<String>,
+    unrealized_pnl: Option<String>,
+    aggregated_pnl: Option<String>,
+    liquidation_price: Option<String>,
+    api_leverage: Option<String>,
+    effective_leverage: Option<f64>,
+    max_leverage: Option<String>,
+    margin_mode: Option<String>,
+    collateral: Option<String>,
+    total_balance: Option<String>,
+    pending_fees: Option<String>,
+    liquidation_buffer: Option<String>,
+    initial_margin_rate: Option<f64>,
+    maintenance_margin_rate: Option<f64>,
+    price_vs_entry_pct: Option<f64>,
+    price_change_24h_pct: Option<f64>,
+    basis_pct: Option<f64>,
+    funding_rate_pct: Option<f64>,
+    funding_direction: Option<String>,
+    open_interest: Option<String>,
+    distance_to_liquidation_pct: Option<f64>,
+    market_bias: String,
+    position_outlook: String,
+    outlook_confidence: String,
+    signals: Vec<String>,
+    projections: ProjectionSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectionSummary {
+    up_1pct_pnl: Option<f64>,
+    up_3pct_pnl: Option<f64>,
+    down_1pct_pnl: Option<f64>,
+    down_3pct_pnl: Option<f64>,
+}
+
+#[derive(Debug)]
+struct DerivedAnalytics {
+    effective_leverage: Option<f64>,
+    initial_margin_rate: Option<f64>,
+    maintenance_margin_rate: Option<f64>,
+    price_vs_entry_pct: Option<f64>,
+    basis_pct: Option<f64>,
+    funding_rate_pct: Option<f64>,
+    funding_direction: Option<String>,
+    distance_to_liquidation_pct: Option<f64>,
+    market_bias: String,
+    position_outlook: String,
+    outlook_confidence: String,
+    signals: Vec<String>,
+    projections: ProjectionSummary,
 }
 
 fn now_unix() -> Result<u64> {
@@ -168,7 +282,8 @@ fn build_jwt(api_key: &str, api_secret: &str, method: &str, path: &str) -> Resul
     let signing_input = format!("{encoded_header}.{encoded_claims}");
 
     let pem = normalize_private_key(api_secret);
-    let secret_key = SecretKey::from_sec1_pem(&pem).context("failed to parse ES256 private key")?;
+    let secret_key =
+        SecretKey::from_sec1_pem(&pem).context("failed to parse ES256 private key")?;
     let signing_key = SigningKey::from(secret_key);
     let signature: Signature = signing_key.sign(signing_input.as_bytes());
     let encoded_signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
@@ -213,7 +328,37 @@ where
 }
 
 fn fetch_portfolios(client: &Client, credentials: &Credentials) -> Result<Vec<Portfolio>> {
-    let response: PortfoliosResponse = get_json(client, credentials, "/api/v3/brokerage/portfolios")?;
+    let response: PortfoliosResponse =
+        get_json(client, credentials, "/api/v3/brokerage/portfolios")?;
+    Ok(response.portfolios)
+}
+
+fn fetch_positions(
+    client: &Client,
+    credentials: &Credentials,
+    portfolio_id: &str,
+) -> Result<Vec<RawPosition>> {
+    let path = format!("/api/v3/brokerage/intx/positions/{portfolio_id}");
+    let response: PositionsResponse = get_json(client, credentials, &path)?;
+    Ok(response.positions)
+}
+
+fn fetch_product(
+    client: &Client,
+    credentials: &Credentials,
+    symbol: &str,
+) -> Result<ProductResponse> {
+    let path = format!("/api/v3/brokerage/products/{symbol}");
+    get_json(client, credentials, &path)
+}
+
+fn fetch_portfolio_summary(
+    client: &Client,
+    credentials: &Credentials,
+    portfolio_id: &str,
+) -> Result<Vec<IntxPortfolioState>> {
+    let path = format!("/api/v3/brokerage/intx/portfolio/{portfolio_id}");
+    let response: IntxPortfolioSummaryResponse = get_json(client, credentials, &path)?;
     Ok(response.portfolios)
 }
 
@@ -257,33 +402,442 @@ fn money_value(money: Option<&Money>) -> Option<String> {
     money.map(|item| item.value.clone())
 }
 
-fn summarize_position(position: RawPosition) -> PositionSummary {
-    PositionSummary {
-        symbol: position.symbol,
-        side: normalize_side(position.position_side.as_deref()),
-        contracts: position.net_size,
-        notional: money_value(position.position_notional.as_ref()),
-        entry_price: money_value(position.entry_vwap.as_ref()),
-        mark_price: money_value(position.mark_price.as_ref()),
-        unrealized_pnl: money_value(position.unrealized_pnl.as_ref()),
-        liquidation_price: money_value(position.liquidation_price.as_ref()),
-        leverage: position.leverage,
-        margin_mode: normalize_margin_mode(position.margin_type.as_deref()),
+fn parse_f64(value: Option<&str>) -> Option<f64> {
+    value.and_then(|item| item.parse::<f64>().ok())
+}
+
+fn format_opt(value: Option<f64>, decimals: usize) -> Option<String> {
+    value.map(|item| format!("{item:.decimals$}"))
+}
+
+fn format_pct(value: Option<f64>) -> Option<String> {
+    format_opt(value, 2).map(|item| format!("{item}%"))
+}
+
+fn product_display_name(product: &ProductResponse) -> Option<String> {
+    product
+        .future_product_details
+        .as_ref()
+        .and_then(|details| {
+            details
+                .display_name
+                .clone()
+                .or_else(|| details.contract_display_name.clone())
+        })
+}
+
+fn product_underlying_type(product: &ProductResponse) -> Option<String> {
+    product
+        .future_product_details
+        .as_ref()
+        .and_then(|details| details.perpetual_details.as_ref())
+        .and_then(|details| details.underlying_type.clone())
+}
+
+fn product_index_price(product: &ProductResponse) -> Option<f64> {
+    product.future_product_details.as_ref().and_then(|details| {
+        parse_f64(details.index_price.as_deref())
+            .or_else(|| parse_f64(product.price.as_deref()))
+    })
+}
+
+fn product_funding_rate(product: &ProductResponse) -> Option<f64> {
+    product.future_product_details.as_ref().and_then(|details| {
+        details
+            .perpetual_details
+            .as_ref()
+            .and_then(|perps| parse_f64(perps.funding_rate.as_deref()))
+            .or_else(|| parse_f64(details.funding_rate.as_deref()))
+    })
+}
+
+fn product_open_interest(product: &ProductResponse) -> Option<f64> {
+    product.future_product_details.as_ref().and_then(|details| {
+        details
+            .perpetual_details
+            .as_ref()
+            .and_then(|perps| parse_f64(perps.open_interest.as_deref()))
+            .or_else(|| parse_f64(details.open_interest.as_deref()))
+    })
+}
+
+fn product_max_leverage(product: &ProductResponse) -> Option<String> {
+    product.future_product_details.as_ref().and_then(|details| {
+        details
+            .perpetual_details
+            .as_ref()
+            .and_then(|perps| perps.max_leverage.clone())
+            .or_else(|| details.max_leverage.clone())
+    })
+}
+
+fn compute_market_bias(
+    price_change_24h_pct: Option<f64>,
+    basis_pct: Option<f64>,
+    funding_rate_pct: Option<f64>,
+) -> (String, usize, i32, Vec<String>) {
+    let mut score = 0i32;
+    let mut observed = 0usize;
+    let mut signals = Vec::new();
+
+    if let Some(change_24h) = price_change_24h_pct {
+        observed += 1;
+        if change_24h >= 0.75 {
+            score += 1;
+            signals.push(format!("24h tape is positive at {change_24h:.2}%."));
+        } else if change_24h <= -0.75 {
+            score -= 1;
+            signals.push(format!("24h tape is negative at {change_24h:.2}%."));
+        } else {
+            signals.push(format!("24h tape is flat-to-neutral at {change_24h:.2}%."));
+        }
+    }
+
+    if let Some(basis) = basis_pct {
+        observed += 1;
+        if basis >= 0.15 {
+            score += 1;
+            signals.push(format!(
+                "Perp is trading {basis:.2}% above index, which is a bullish basis."
+            ));
+        } else if basis <= -0.15 {
+            score -= 1;
+            signals.push(format!(
+                "Perp is trading {basis:.2}% below index, which is a bearish discount."
+            ));
+        } else {
+            signals.push(format!("Perp basis vs index is muted at {basis:.2}%."));
+        }
+    }
+
+    if let Some(funding) = funding_rate_pct {
+        observed += 1;
+        if funding >= 0.005 {
+            score += 1;
+            signals.push(format!(
+                "Funding is +{funding:.4}% per interval, which shows long-side demand."
+            ));
+        } else if funding <= -0.005 {
+            score -= 1;
+            signals.push(format!(
+                "Funding is {funding:.4}% per interval, which shows short-side demand."
+            ));
+        } else {
+            signals.push(format!("Funding is near neutral at {funding:.4}% per interval."));
+        }
+    }
+
+    let bias = match score {
+        2..=i32::MAX => "bullish",
+        1 => "mildly bullish",
+        0 => "neutral",
+        -1 => "mildly bearish",
+        i32::MIN..=-2 => "bearish",
+    }
+    .to_string();
+
+    (bias, observed, score, signals)
+}
+
+fn compute_outlook(
+    side: Option<&str>,
+    price_vs_entry_pct: Option<f64>,
+    distance_to_liquidation_pct: Option<f64>,
+    bias_score: i32,
+    observed_bias_inputs: usize,
+) -> (String, String, Vec<String>) {
+    let side_multiplier = match side {
+        Some("long") => 1,
+        Some("short") => -1,
+        _ => 0,
+    };
+
+    let mut outlook_score = bias_score * side_multiplier;
+    let mut signals = Vec::new();
+
+    if let Some(price_vs_entry) = price_vs_entry_pct {
+        if price_vs_entry >= 0.25 {
+            outlook_score += side_multiplier;
+            signals.push(format!(
+                "Position is above entry by {price_vs_entry:.2}%, which supports the current side."
+            ));
+        } else if price_vs_entry <= -0.25 {
+            outlook_score -= side_multiplier;
+            signals.push(format!(
+                "Position is below entry by {price_vs_entry:.2}%, which is pressure on the current side."
+            ));
+        } else {
+            signals.push(format!(
+                "Position is close to entry at {price_vs_entry:.2}% vs average entry."
+            ));
+        }
+    }
+
+    if let Some(distance) = distance_to_liquidation_pct {
+        if distance < 10.0 {
+            outlook_score -= 2;
+            signals.push(format!(
+                "Liquidation is only {distance:.2}% away, which is high risk."
+            ));
+        } else if distance < 20.0 {
+            outlook_score -= 1;
+            signals.push(format!(
+                "Liquidation is {distance:.2}% away, which is a moderate risk buffer."
+            ));
+        } else {
+            signals.push(format!(
+                "Liquidation is {distance:.2}% away, which is a comfortable buffer."
+            ));
+        }
+    }
+
+    let outlook = match outlook_score {
+        2..=i32::MAX => "favorable",
+        1 => "constructive",
+        0 => "mixed",
+        -1 => "cautious",
+        i32::MIN..=-2 => "at risk",
+    }
+    .to_string();
+
+    let confidence = match observed_bias_inputs {
+        0 | 1 => "low",
+        2 => "medium",
+        _ => "medium",
+    }
+    .to_string();
+
+    (outlook, confidence, signals)
+}
+
+fn compute_projections(side: Option<&str>, mark_price: Option<f64>, contracts: Option<f64>) -> ProjectionSummary {
+    let direction = match side {
+        Some("short") => -1.0,
+        _ => 1.0,
+    };
+    let delta = contracts.zip(mark_price).map(|(size, mark)| size * mark * direction);
+
+    ProjectionSummary {
+        up_1pct_pnl: delta.map(|item| item * 0.01),
+        up_3pct_pnl: delta.map(|item| item * 0.03),
+        down_1pct_pnl: delta.map(|item| -item * 0.01),
+        down_3pct_pnl: delta.map(|item| -item * 0.03),
     }
 }
 
-fn fetch_positions(
-    client: &Client,
-    credentials: &Credentials,
-    portfolio_id: &str,
-) -> Result<Vec<PositionSummary>> {
-    let path = format!("/api/v3/brokerage/intx/positions/{portfolio_id}");
-    let response: PositionsResponse = get_json(client, credentials, &path)?;
-    Ok(response
-        .positions
-        .into_iter()
-        .map(summarize_position)
-        .collect())
+fn analyze_position(
+    position: &RawPosition,
+    product: Option<&ProductResponse>,
+    portfolio_state: Option<&IntxPortfolioState>,
+) -> DerivedAnalytics {
+    let side = normalize_side(position.position_side.as_deref());
+    let mark_price = parse_f64(money_value(position.mark_price.as_ref()).as_deref());
+    let entry_price = parse_f64(money_value(position.entry_vwap.as_ref()).as_deref());
+    let liquidation_price = parse_f64(money_value(position.liquidation_price.as_ref()).as_deref());
+    let contracts = parse_f64(position.net_size.as_deref());
+    let notional = parse_f64(money_value(position.position_notional.as_ref()).as_deref());
+
+    let price_change_24h_pct =
+        product.and_then(|item| parse_f64(item.price_percentage_change_24h.as_deref()));
+    let index_price = product.and_then(product_index_price);
+    let basis_pct = mark_price
+        .zip(index_price)
+        .and_then(|(mark, index)| (index != 0.0).then_some(((mark - index) / index) * 100.0));
+    let funding_rate_pct = product.and_then(product_funding_rate).map(|value| value * 100.0);
+
+    let funding_direction = funding_rate_pct.map(|value| {
+        if value > 0.0 {
+            "longs paying shorts".to_string()
+        } else if value < 0.0 {
+            "shorts paying longs".to_string()
+        } else {
+            "neutral funding".to_string()
+        }
+    });
+
+    let price_vs_entry_pct = mark_price
+        .zip(entry_price)
+        .and_then(|(mark, entry)| (entry != 0.0).then_some(((mark - entry) / entry) * 100.0));
+
+    let effective_leverage = portfolio_state.and_then(|state| {
+        let collateral = parse_f64(Some(state.collateral.as_str()))?;
+        let state_notional = parse_f64(Some(state.position_notional.as_str())).or(notional)?;
+        (collateral != 0.0).then_some(state_notional / collateral)
+    });
+
+    let initial_margin_rate = portfolio_state
+        .and_then(|state| parse_f64(Some(state.portfolio_initial_margin.as_str())).map(|v| v * 100.0));
+    let maintenance_margin_rate = portfolio_state
+        .and_then(|state| parse_f64(Some(state.portfolio_maintenance_margin.as_str())).map(|v| v * 100.0));
+
+    let distance_to_liquidation_pct = mark_price.zip(liquidation_price).and_then(|(mark, liq)| {
+        if mark == 0.0 {
+            None
+        } else if side.as_deref() == Some("short") {
+            Some(((liq - mark) / mark) * 100.0)
+        } else {
+            Some(((mark - liq) / mark) * 100.0)
+        }
+    });
+
+    let (market_bias, observed_bias_inputs, bias_score, mut bias_signals) =
+        compute_market_bias(price_change_24h_pct, basis_pct, funding_rate_pct);
+    let (position_outlook, outlook_confidence, mut outlook_signals) = compute_outlook(
+        side.as_deref(),
+        price_vs_entry_pct,
+        distance_to_liquidation_pct,
+        bias_score,
+        observed_bias_inputs,
+    );
+
+    let projections = compute_projections(side.as_deref(), mark_price, contracts);
+
+    let mut signals = Vec::new();
+    signals.append(&mut bias_signals);
+    signals.append(&mut outlook_signals);
+    if let Some(leverage) = effective_leverage {
+        signals.push(format!(
+            "Effective leverage from isolated collateral is {leverage:.2}x."
+        ));
+    }
+
+    DerivedAnalytics {
+        effective_leverage,
+        initial_margin_rate,
+        maintenance_margin_rate,
+        price_vs_entry_pct,
+        basis_pct,
+        funding_rate_pct,
+        funding_direction,
+        distance_to_liquidation_pct,
+        market_bias,
+        position_outlook,
+        outlook_confidence,
+        signals,
+        projections,
+    }
+}
+
+fn summarize_position(
+    position: RawPosition,
+    product: Option<&ProductResponse>,
+    portfolio_state: Option<&IntxPortfolioState>,
+) -> PositionSummary {
+    let analytics = analyze_position(&position, product, portfolio_state);
+
+    PositionSummary {
+        symbol: position.symbol.clone(),
+        display_name: product.and_then(product_display_name),
+        underlying_type: product.and_then(product_underlying_type),
+        side: normalize_side(position.position_side.as_deref()),
+        contracts: position.net_size.clone(),
+        notional: money_value(position.position_notional.as_ref()),
+        entry_price: money_value(position.entry_vwap.as_ref()),
+        mark_price: money_value(position.mark_price.as_ref()),
+        index_price: format_opt(product.and_then(product_index_price), 2),
+        vwap_price: money_value(position.vwap.as_ref()),
+        unrealized_pnl: money_value(position.unrealized_pnl.as_ref()),
+        aggregated_pnl: money_value(position.aggregated_pnl.as_ref()),
+        liquidation_price: money_value(position.liquidation_price.as_ref()),
+        api_leverage: position.leverage.clone(),
+        effective_leverage: analytics.effective_leverage,
+        max_leverage: product.and_then(product_max_leverage),
+        margin_mode: normalize_margin_mode(position.margin_type.as_deref()),
+        collateral: portfolio_state.map(|state| state.collateral.clone()),
+        total_balance: portfolio_state.map(|state| state.total_balance.value.clone()),
+        pending_fees: portfolio_state.map(|state| state.pending_fees.clone()),
+        liquidation_buffer: portfolio_state.map(|state| state.liquidation_buffer.clone()),
+        initial_margin_rate: analytics.initial_margin_rate,
+        maintenance_margin_rate: analytics.maintenance_margin_rate,
+        price_vs_entry_pct: analytics.price_vs_entry_pct,
+        price_change_24h_pct: product.and_then(|item| parse_f64(item.price_percentage_change_24h.as_deref())),
+        basis_pct: analytics.basis_pct,
+        funding_rate_pct: analytics.funding_rate_pct,
+        funding_direction: analytics.funding_direction,
+        open_interest: format_opt(product.and_then(product_open_interest), 2),
+        distance_to_liquidation_pct: analytics.distance_to_liquidation_pct,
+        market_bias: analytics.market_bias,
+        position_outlook: analytics.position_outlook,
+        outlook_confidence: analytics.outlook_confidence,
+        signals: analytics.signals,
+        projections: analytics.projections,
+    }
+}
+
+fn print_position(index: usize, position: &PositionSummary) {
+    println!(
+        "{}. {}{}",
+        index + 1,
+        position.symbol,
+        position
+            .display_name
+            .as_deref()
+            .map(|item| format!(" ({item})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "   Position: {} | contracts={} | entry={} | mark={} | index={} | pnl={} | aggPnl={}",
+        position.side.as_deref().unwrap_or("unknown"),
+        position.contracts.as_deref().unwrap_or("unknown"),
+        position.entry_price.as_deref().unwrap_or("unknown"),
+        position.mark_price.as_deref().unwrap_or("unknown"),
+        position.index_price.as_deref().unwrap_or("unknown"),
+        position.unrealized_pnl.as_deref().unwrap_or("unknown"),
+        position.aggregated_pnl.as_deref().unwrap_or("unknown"),
+    );
+    println!(
+        "   Risk: effectiveLev={}x | apiLev={}x | collateral={} | liq={} | liqDistance={} | liqBuffer={}",
+        format_opt(position.effective_leverage, 2).as_deref().unwrap_or("unknown"),
+        position.api_leverage.as_deref().unwrap_or("unknown"),
+        position.collateral.as_deref().unwrap_or("unknown"),
+        position.liquidation_price.as_deref().unwrap_or("unknown"),
+        format_pct(position.distance_to_liquidation_pct)
+            .as_deref()
+            .unwrap_or("unknown"),
+        position.liquidation_buffer.as_deref().unwrap_or("unknown"),
+    );
+    println!(
+        "   Market: 24h={} | basis={} | funding={} ({}) | openInterest={} | maxLev={}x",
+        format_pct(position.price_change_24h_pct)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_pct(position.basis_pct).as_deref().unwrap_or("unknown"),
+        format_opt(position.funding_rate_pct, 4)
+            .map(|item| format!("{item}%"))
+            .as_deref()
+            .unwrap_or("unknown"),
+        position
+            .funding_direction
+            .as_deref()
+            .unwrap_or("unknown funding"),
+        position.open_interest.as_deref().unwrap_or("unknown"),
+        position.max_leverage.as_deref().unwrap_or("unknown"),
+    );
+    println!(
+        "   Heuristic outlook: bias={} | position={} | confidence={}",
+        position.market_bias, position.position_outlook, position.outlook_confidence
+    );
+    println!(
+        "   Projections: +1%={} | +3%={} | -1%={} | -3%={}",
+        format_opt(position.projections.up_1pct_pnl, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_opt(position.projections.up_3pct_pnl, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_opt(position.projections.down_1pct_pnl, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_opt(position.projections.down_3pct_pnl, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+    );
+    if !position.signals.is_empty() {
+        println!("   Signals:");
+        for signal in &position.signals {
+            println!("     - {signal}");
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -294,6 +848,34 @@ fn main() -> Result<()> {
     let portfolios = fetch_portfolios(&client, &credentials)?;
     let portfolio = select_portfolio(&portfolios, args.portfolio.as_deref())?;
     let positions = fetch_positions(&client, &credentials, &portfolio.uuid)?;
+    let portfolio_states = fetch_portfolio_summary(&client, &credentials, &portfolio.uuid)?;
+
+    let mut product_cache = HashMap::new();
+    for position in &positions {
+        product_cache
+            .entry(position.symbol.clone())
+            .or_insert_with(|| fetch_product(&client, &credentials, &position.symbol));
+    }
+
+    let portfolio_state_lookup: HashMap<&str, &IntxPortfolioState> = portfolio_states
+        .iter()
+        .map(|state| (state.portfolio_uuid.as_str(), state))
+        .collect();
+
+    let positions = positions
+        .into_iter()
+        .map(|position| {
+            let product = product_cache
+                .get(&position.symbol)
+                .and_then(|result| result.as_ref().ok());
+            let position_portfolio_id = position.portfolio_uuid.as_deref().unwrap_or(&portfolio.uuid);
+            let portfolio_state = portfolio_state_lookup
+                .get(position_portfolio_id)
+                .copied()
+                .or_else(|| portfolio_state_lookup.get(portfolio.uuid.as_str()).copied());
+            summarize_position(position, product, portfolio_state)
+        })
+        .collect::<Vec<_>>();
 
     let output = Output {
         credential_source: credentials.source,
@@ -302,6 +884,7 @@ fn main() -> Result<()> {
             portfolio_type: portfolio.portfolio_type.clone(),
         },
         portfolio_count: portfolios.len(),
+        analysis_basis: "Heuristic snapshot derived from Coinbase position, product, and portfolio summary endpoints. Not a predictive model.",
         positions,
     };
 
@@ -316,6 +899,7 @@ fn main() -> Result<()> {
         output.portfolio.id, output.portfolio.portfolio_type
     );
     println!("Portfolio count: {}", output.portfolio_count);
+    println!("Analysis basis: {}", output.analysis_basis);
     println!("Open positions: {}", output.positions.len());
 
     if output.positions.is_empty() {
@@ -324,21 +908,7 @@ fn main() -> Result<()> {
     }
 
     for (index, position) in output.positions.iter().enumerate() {
-        println!(
-            "{}. {} | {} | contracts={} | notional={} | entry={} | liq={} | leverage={} | marginMode={}",
-            index + 1,
-            position.symbol,
-            position.side.as_deref().unwrap_or("unknown"),
-            position.contracts.as_deref().unwrap_or("unknown"),
-            position.notional.as_deref().unwrap_or("unknown"),
-            position.entry_price.as_deref().unwrap_or("unknown"),
-            position
-                .liquidation_price
-                .as_deref()
-                .unwrap_or("unknown"),
-            position.leverage.as_deref().unwrap_or("unknown"),
-            position.margin_mode.as_deref().unwrap_or("unknown"),
-        );
+        print_position(index, position);
     }
 
     Ok(())
