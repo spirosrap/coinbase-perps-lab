@@ -112,7 +112,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: rgba(29, 35, 43, 0.08);
       color: var(--ink);
     }
-    .hero-grid, .stats-grid, .scenario-grid {
+    .hero-grid, .stats-grid, .scenario-grid, .execution-grid {
       display: grid;
       gap: 14px;
     }
@@ -207,6 +207,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .scenario-grid {
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       margin: 16px 0;
+    }
+    .execution-grid {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin: 16px 0;
+    }
+    .execution-panel {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--panel-strong);
+      padding: 16px;
+    }
+    .section-title {
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      color: var(--muted);
+      margin: 4px 0 10px;
+    }
+    .execution-panel .scenario-grid {
+      margin: 0;
+    }
+    .execution-panel .scenario {
+      padding: 14px;
+    }
+    .execution-meta {
+      margin-top: 8px;
+      font-size: 0.92rem;
+      color: var(--muted);
     }
     .scenario {
       padding: 16px;
@@ -306,6 +334,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `${Number(value).toFixed(2)}%`;
     }
 
+    function formatBps(value, digits = 2) {
+      if (value === null || value === undefined) return "unknown";
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "unknown";
+      return `${num.toFixed(digits)} bps`;
+    }
+
+    function formatQuoteNotional(value) {
+      if (value === null || value === undefined) return "unknown";
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "unknown";
+      if (Math.abs(num) >= 1000 && Math.abs(num % 1000) < 1e-9) {
+        return `$${(num / 1000).toFixed(0)}k`;
+      }
+      return `$${num.toFixed(0)}`;
+    }
+
     function formatSigned(value, digits = 2) {
       if (value === null || value === undefined) return "unknown";
       const num = Number(value);
@@ -343,9 +388,44 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `<div class="scenario"><div class="stat-label">${escapeHtml(label)}</div><div class="scenario-value ${toneClass(value)}">${escapeHtml(formatSigned(value, 2))}</div></div>`;
     }
 
+    function slippageCard(estimate, sideLabel) {
+      const fillStatus = estimate?.complete === false
+        ? `Partial fill ${formatPct(estimate.fill_pct)}`
+        : "Complete ladder";
+      const worst = estimate?.worst_price != null ? `Worst ${formatMaybe(estimate.worst_price, 2)}` : "Worst unknown";
+      return `
+        <div class="scenario">
+          <div class="stat-label">${escapeHtml(formatQuoteNotional(estimate?.quote_notional))} ${escapeHtml(sideLabel)}</div>
+          <div class="scenario-value neutral-text">${escapeHtml(formatBps(estimate?.slippage_bps))}</div>
+          <div class="execution-meta">Avg ${escapeHtml(formatMaybe(estimate?.average_price, 2))} | ${escapeHtml(worst)} | ${escapeHtml(fillStatus)}</div>
+        </div>
+      `;
+    }
+
+    function executionPanel(label, estimates, sideLabel) {
+      if (!(estimates || []).length) {
+        return `
+          <section class="execution-panel">
+            <div class="section-title">${escapeHtml(label)}</div>
+            <div class="execution-meta">No book-based execution estimate available.</div>
+          </section>
+        `;
+      }
+
+      return `
+        <section class="execution-panel">
+          <div class="section-title">${escapeHtml(label)}</div>
+          <div class="scenario-grid">${estimates.map((estimate) => slippageCard(estimate, sideLabel)).join("")}</div>
+        </section>
+      `;
+    }
+
     function positionCard(pos) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const spreadValue = pos.order_book?.spread_absolute != null || pos.order_book?.spread_bps != null
+        ? `${formatMaybe(pos.order_book?.spread_absolute, 4)} | ${formatBps(pos.order_book?.spread_bps)}`
+        : "unknown";
       return `
         <article class="card">
           <div class="card-header">
@@ -374,6 +454,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Open Interest", pos.open_interest || "unknown")}
             ${statCard("OI Notional", pos.open_interest_notional != null ? formatMaybe(pos.open_interest_notional, 2) : "unknown")}
             ${statCard("Position Share of OI", pos.position_share_of_open_interest_pct != null ? `${formatMaybe(pos.position_share_of_open_interest_pct, 2)}%` : "unknown")}
+            ${statCard("Best Bid", pos.order_book?.best_bid != null ? formatMaybe(pos.order_book.best_bid, 2) : "unknown")}
+            ${statCard("Best Ask", pos.order_book?.best_ask != null ? formatMaybe(pos.order_book.best_ask, 2) : "unknown")}
+            ${statCard("Spread", spreadValue)}
+            ${statCard("Book Levels", pos.order_book ? `${pos.order_book.bid_levels}/${pos.order_book.ask_levels}` : "unknown")}
             ${statCard("Basis", formatPct(pos.basis_pct), toneClass(pos.basis_pct))}
             ${statCard("24h Change", formatPct(pos.price_change_24h_pct), toneClass(pos.price_change_24h_pct))}
             ${statCard("Liq Distance", formatPct(pos.distance_to_liquidation_pct))}
@@ -390,7 +474,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${scenarioCard("-3% move", pos.projections?.down_3pct_pnl)}
           </div>
 
-          <div class="signal-note">Signals are heuristic summaries derived from Coinbase position, product, and portfolio summary fields.</div>
+          <div class="execution-grid">
+            ${executionPanel("Buy Slippage vs Best Ask", pos.order_book?.buy_slippage, "buy")}
+            ${executionPanel("Sell Slippage vs Best Bid", pos.order_book?.sell_slippage, "sell")}
+          </div>
+
+          <div class="signal-note">Signals are heuristic summaries derived from Coinbase position, product, portfolio summary, and product book fields.</div>
           <ul class="signals">${signals}</ul>
         </article>
       `;

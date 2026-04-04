@@ -7,7 +7,7 @@ use p256::ecdsa::{Signature, SigningKey};
 use p256::SecretKey;
 use rand::RngCore;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -16,8 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_HOST: &str = "api.coinbase.com";
 const API_BASE: &str = "https://api.coinbase.com";
+const ORDER_BOOK_LEVEL_LIMIT: usize = 100;
+const SLIPPAGE_NOTIONAL_TARGETS: [f64; 4] = [5_000.0, 10_000.0, 20_000.0, 40_000.0];
 pub const ANALYSIS_BASIS: &str =
-    "Heuristic snapshot derived from Coinbase position, product, and portfolio summary endpoints. Not a predictive model.";
+    "Heuristic snapshot derived from Coinbase position, product, portfolio summary, and product book endpoints. Not a predictive model.";
 
 #[derive(Debug, Clone)]
 struct Credentials {
@@ -77,6 +79,35 @@ struct ProductResponse {
     price_percentage_change_24h: Option<String>,
     #[serde(default)]
     future_product_details: Option<FutureProductDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductBookResponse {
+    pricebook: PriceBook,
+    #[serde(default)]
+    mid_market: Option<String>,
+    #[serde(default)]
+    spread_bps: Option<String>,
+    #[serde(default)]
+    spread_absolute: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceBook {
+    #[allow(dead_code)]
+    product_id: String,
+    #[serde(default)]
+    bids: Vec<BookLevel>,
+    #[serde(default)]
+    asks: Vec<BookLevel>,
+    #[serde(default)]
+    time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BookLevel {
+    price: String,
+    size: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +206,7 @@ pub struct PositionSummary {
     pub open_interest: Option<String>,
     pub open_interest_notional: Option<f64>,
     pub position_share_of_open_interest_pct: Option<f64>,
+    pub order_book: Option<OrderBookSummary>,
     pub distance_to_liquidation_pct: Option<f64>,
     pub market_bias: String,
     pub position_outlook: String,
@@ -191,6 +223,32 @@ pub struct ProjectionSummary {
     pub down_3pct_pnl: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct OrderBookSummary {
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub mid_market: Option<f64>,
+    pub spread_absolute: Option<f64>,
+    pub spread_bps: Option<f64>,
+    pub book_time: Option<String>,
+    pub bid_levels: usize,
+    pub ask_levels: usize,
+    pub buy_slippage: Vec<SlippageEstimate>,
+    pub sell_slippage: Vec<SlippageEstimate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SlippageEstimate {
+    pub quote_notional: f64,
+    pub average_price: Option<f64>,
+    pub worst_price: Option<f64>,
+    pub slippage_bps: Option<f64>,
+    pub filled_quote: Option<f64>,
+    pub filled_base: Option<f64>,
+    pub fill_pct: Option<f64>,
+    pub complete: bool,
+}
+
 #[derive(Debug)]
 struct DerivedAnalytics {
     effective_leverage: Option<f64>,
@@ -203,12 +261,25 @@ struct DerivedAnalytics {
     funding_intensity: Option<String>,
     open_interest_notional: Option<f64>,
     position_share_of_open_interest_pct: Option<f64>,
+    order_book: Option<OrderBookSummary>,
     distance_to_liquidation_pct: Option<f64>,
     market_bias: String,
     position_outlook: String,
     outlook_confidence: String,
     signals: Vec<String>,
     projections: ProjectionSummary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedBookLevel {
+    price: f64,
+    size: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExecutionSide {
+    Buy,
+    Sell,
 }
 
 fn now_unix() -> Result<u64> {
@@ -325,6 +396,27 @@ where
         .with_context(|| format!("failed to decode Coinbase JSON for GET {path}"))
 }
 
+fn get_public_json<T>(client: &Client, path: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let response = client
+        .get(format!("{API_BASE}{path}"))
+        .header(CACHE_CONTROL, "no-cache")
+        .send()
+        .with_context(|| format!("request failed for GET {path}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!("Coinbase returned {status} for GET {path}: {body}");
+    }
+
+    response
+        .json::<T>()
+        .with_context(|| format!("failed to decode Coinbase JSON for GET {path}"))
+}
+
 fn fetch_portfolios(client: &Client, credentials: &Credentials) -> Result<Vec<Portfolio>> {
     let response: PortfoliosResponse =
         get_json(client, credentials, "/api/v3/brokerage/portfolios")?;
@@ -348,6 +440,17 @@ fn fetch_product(
 ) -> Result<ProductResponse> {
     let path = format!("/api/v3/brokerage/products/{symbol}");
     get_json(client, credentials, &path)
+}
+
+fn fetch_product_book(
+    client: &Client,
+    _credentials: &Credentials,
+    symbol: &str,
+) -> Result<ProductBookResponse> {
+    let path = format!(
+        "/api/v3/brokerage/market/product_book?product_id={symbol}&limit={ORDER_BOOK_LEVEL_LIMIT}"
+    );
+    get_public_json(client, &path)
 }
 
 fn fetch_portfolio_summary(
@@ -410,6 +513,115 @@ pub fn format_opt(value: Option<f64>, decimals: usize) -> Option<String> {
 
 pub fn format_pct(value: Option<f64>) -> Option<String> {
     format_opt(value, 2).map(|item| format!("{item}%"))
+}
+
+fn parse_book_levels(levels: &[BookLevel]) -> Vec<ParsedBookLevel> {
+    levels
+        .iter()
+        .filter_map(|level| {
+            let price = parse_f64(Some(level.price.as_str()))?;
+            let size = parse_f64(Some(level.size.as_str()))?;
+            (price > 0.0 && size > 0.0).then_some(ParsedBookLevel { price, size })
+        })
+        .collect()
+}
+
+fn estimate_quote_execution(
+    levels: &[ParsedBookLevel],
+    target_quote: f64,
+    reference_price: Option<f64>,
+    side: ExecutionSide,
+) -> SlippageEstimate {
+    let mut remaining_quote = target_quote.max(0.0);
+    let mut filled_quote = 0.0;
+    let mut filled_base = 0.0;
+    let mut worst_price = None;
+
+    for level in levels {
+        if remaining_quote <= 1e-9 {
+            break;
+        }
+
+        let available_quote = level.price * level.size;
+        if available_quote <= 0.0 {
+            continue;
+        }
+
+        let take_quote = remaining_quote.min(available_quote);
+        let take_base = take_quote / level.price;
+
+        filled_quote += take_quote;
+        filled_base += take_base;
+        remaining_quote -= take_quote;
+        worst_price = Some(level.price);
+    }
+
+    let complete = remaining_quote <= target_quote.max(1.0) * 1e-6;
+    let average_price = (filled_base > 0.0).then_some(filled_quote / filled_base);
+    let slippage_bps = average_price.zip(reference_price).and_then(|(avg, reference)| {
+        if reference <= 0.0 {
+            None
+        } else {
+            let bps = match side {
+                ExecutionSide::Buy => ((avg - reference) / reference) * 10_000.0,
+                ExecutionSide::Sell => ((reference - avg) / reference) * 10_000.0,
+            };
+            Some(bps.max(0.0))
+        }
+    });
+
+    SlippageEstimate {
+        quote_notional: target_quote,
+        average_price,
+        worst_price,
+        slippage_bps,
+        filled_quote: (filled_quote > 0.0).then_some(filled_quote),
+        filled_base: (filled_base > 0.0).then_some(filled_base),
+        fill_pct: (target_quote > 0.0).then_some((filled_quote / target_quote).min(1.0) * 100.0),
+        complete,
+    }
+}
+
+fn build_order_book_summary(book: &ProductBookResponse) -> Option<OrderBookSummary> {
+    let bids = parse_book_levels(&book.pricebook.bids);
+    let asks = parse_book_levels(&book.pricebook.asks);
+    if bids.is_empty() && asks.is_empty() {
+        return None;
+    }
+
+    let best_bid = bids.first().map(|level| level.price);
+    let best_ask = asks.first().map(|level| level.price);
+    let mid_market = parse_f64(book.mid_market.as_deref())
+        .or_else(|| best_bid.zip(best_ask).map(|(bid, ask)| (bid + ask) / 2.0));
+    let spread_absolute = parse_f64(book.spread_absolute.as_deref())
+        .or_else(|| best_ask.zip(best_bid).map(|(ask, bid)| ask - bid));
+    let spread_bps = parse_f64(book.spread_bps.as_deref()).or_else(|| {
+        mid_market.zip(spread_absolute).and_then(|(mid, spread)| {
+            (mid > 0.0).then_some((spread / mid) * 10_000.0)
+        })
+    });
+
+    let buy_slippage = SLIPPAGE_NOTIONAL_TARGETS
+        .iter()
+        .map(|target| estimate_quote_execution(&asks, *target, best_ask, ExecutionSide::Buy))
+        .collect();
+    let sell_slippage = SLIPPAGE_NOTIONAL_TARGETS
+        .iter()
+        .map(|target| estimate_quote_execution(&bids, *target, best_bid, ExecutionSide::Sell))
+        .collect();
+
+    Some(OrderBookSummary {
+        best_bid,
+        best_ask,
+        mid_market,
+        spread_absolute,
+        spread_bps,
+        book_time: book.pricebook.time.clone(),
+        bid_levels: bids.len(),
+        ask_levels: asks.len(),
+        buy_slippage,
+        sell_slippage,
+    })
 }
 
 fn product_display_name(product: &ProductResponse) -> Option<String> {
@@ -655,6 +867,7 @@ fn classify_funding_intensity(funding_rate_pct: Option<f64>) -> Option<String> {
 fn analyze_position(
     position: &RawPosition,
     product: Option<&ProductResponse>,
+    product_book: Option<&ProductBookResponse>,
     portfolio_state: Option<&IntxPortfolioState>,
 ) -> DerivedAnalytics {
     let side = normalize_side(position.position_side.as_deref());
@@ -687,6 +900,7 @@ fn analyze_position(
     let position_share_of_open_interest_pct = contracts
         .zip(open_interest)
         .and_then(|(size, oi)| (oi != 0.0).then_some((size / oi) * 100.0));
+    let order_book = product_book.and_then(build_order_book_summary);
 
     let price_vs_entry_pct = mark_price
         .zip(entry_price)
@@ -746,6 +960,57 @@ fn analyze_position(
     if let Some(share) = position_share_of_open_interest_pct {
         signals.push(format!("Your position is {share:.2}% of current open interest."));
     }
+    if let Some(book) = order_book.as_ref() {
+        if let Some(spread_bps) = book.spread_bps {
+            let spread_absolute = book
+                .spread_absolute
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            signals.push(format!(
+                "Top-of-book spread is {spread_bps:.2} bps ({spread_absolute} absolute)."
+            ));
+        }
+
+        let buy_10k = book
+            .buy_slippage
+            .iter()
+            .find(|estimate| (estimate.quote_notional - 10_000.0).abs() < 0.5);
+        let sell_10k = book
+            .sell_slippage
+            .iter()
+            .find(|estimate| (estimate.quote_notional - 10_000.0).abs() < 0.5);
+
+        if let (Some(buy), Some(sell)) = (buy_10k, sell_10k) {
+            if buy.complete && sell.complete {
+                signals.push(format!(
+                    "Estimated market-order slippage for $10k quote notional is {} bps to buy and {} bps to sell.",
+                    format_opt(buy.slippage_bps, 2)
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    format_opt(sell.slippage_bps, 2)
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                ));
+            }
+        }
+
+        let buy_max_complete = book
+            .buy_slippage
+            .last()
+            .map(|estimate| estimate.complete)
+            .unwrap_or(false);
+        let sell_max_complete = book
+            .sell_slippage
+            .last()
+            .map(|estimate| estimate.complete)
+            .unwrap_or(false);
+        if !buy_max_complete || !sell_max_complete {
+            signals.push(
+                "The fetched order-book ladder does not fully cover the largest preset execution size on at least one side."
+                    .to_string(),
+            );
+        }
+    }
 
     DerivedAnalytics {
         effective_leverage,
@@ -758,6 +1023,7 @@ fn analyze_position(
         funding_intensity,
         open_interest_notional,
         position_share_of_open_interest_pct,
+        order_book,
         distance_to_liquidation_pct,
         market_bias,
         position_outlook,
@@ -770,9 +1036,10 @@ fn analyze_position(
 fn summarize_position(
     position: RawPosition,
     product: Option<&ProductResponse>,
+    product_book: Option<&ProductBookResponse>,
     portfolio_state: Option<&IntxPortfolioState>,
 ) -> PositionSummary {
-    let analytics = analyze_position(&position, product, portfolio_state);
+    let analytics = analyze_position(&position, product, product_book, portfolio_state);
 
     PositionSummary {
         symbol: position.symbol.clone(),
@@ -807,6 +1074,7 @@ fn summarize_position(
         open_interest: format_opt(product.and_then(product_open_interest), 2),
         open_interest_notional: analytics.open_interest_notional,
         position_share_of_open_interest_pct: analytics.position_share_of_open_interest_pct,
+        order_book: analytics.order_book,
         distance_to_liquidation_pct: analytics.distance_to_liquidation_pct,
         market_bias: analytics.market_bias,
         position_outlook: analytics.position_outlook,
@@ -826,10 +1094,14 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
     let portfolio_states = fetch_portfolio_summary(&client, &credentials, &portfolio.uuid)?;
 
     let mut product_cache = HashMap::new();
+    let mut product_book_cache = HashMap::new();
     for position in &positions {
         product_cache
             .entry(position.symbol.clone())
             .or_insert_with(|| fetch_product(&client, &credentials, &position.symbol));
+        product_book_cache
+            .entry(position.symbol.clone())
+            .or_insert_with(|| fetch_product_book(&client, &credentials, &position.symbol));
     }
 
     let portfolio_state_lookup: HashMap<&str, &IntxPortfolioState> = portfolio_states
@@ -843,6 +1115,9 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
             let product = product_cache
                 .get(&position.symbol)
                 .and_then(|result| result.as_ref().ok());
+            let product_book = product_book_cache
+                .get(&position.symbol)
+                .and_then(|result| result.as_ref().ok());
             let position_portfolio_id = position
                 .portfolio_uuid
                 .as_deref()
@@ -851,7 +1126,7 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
                 .get(position_portfolio_id)
                 .copied()
                 .or_else(|| portfolio_state_lookup.get(portfolio.uuid.as_str()).copied());
-            summarize_position(position, product, portfolio_state)
+            summarize_position(position, product, product_book, portfolio_state)
         })
         .collect::<Vec<_>>();
 
@@ -865,6 +1140,50 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
         analysis_basis: ANALYSIS_BASIS,
         positions,
     })
+}
+
+fn format_quote_notional(target_quote: f64) -> String {
+    if (target_quote % 1_000.0).abs() < f64::EPSILON {
+        format!("${:.0}k", target_quote / 1_000.0)
+    } else {
+        format!("${target_quote:.0}")
+    }
+}
+
+fn render_slippage_estimate_cli(estimate: &SlippageEstimate) -> String {
+    let mut summary = format!(
+        "{} {}bps @{}",
+        format_quote_notional(estimate.quote_notional),
+        format_opt(estimate.slippage_bps, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_opt(estimate.average_price, 2)
+            .as_deref()
+            .unwrap_or("unknown"),
+    );
+
+    if !estimate.complete {
+        summary.push_str(&format!(
+            " (partial {}%)",
+            format_opt(estimate.fill_pct, 1)
+                .as_deref()
+                .unwrap_or("unknown")
+        ));
+    }
+
+    summary
+}
+
+fn render_slippage_side_cli(estimates: &[SlippageEstimate]) -> String {
+    if estimates.is_empty() {
+        return "unknown".to_string();
+    }
+
+    estimates
+        .iter()
+        .map(render_slippage_estimate_cli)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn render_position_lines(index: usize, position: &PositionSummary) -> String {
@@ -927,6 +1246,27 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
             .unwrap_or("unknown"),
         position.max_leverage.as_deref().unwrap_or("unknown"),
     ));
+    if let Some(book) = position.order_book.as_ref() {
+        lines.push(format!(
+            "   Execution: bestBid={} | bestAsk={} | spread={} ({} bps) | bookLevels={}/{}",
+            format_opt(book.best_bid, 2).as_deref().unwrap_or("unknown"),
+            format_opt(book.best_ask, 2).as_deref().unwrap_or("unknown"),
+            format_opt(book.spread_absolute, 4)
+                .as_deref()
+                .unwrap_or("unknown"),
+            format_opt(book.spread_bps, 2).as_deref().unwrap_or("unknown"),
+            book.bid_levels,
+            book.ask_levels,
+        ));
+        lines.push(format!(
+            "   Buy slip: {}",
+            render_slippage_side_cli(&book.buy_slippage)
+        ));
+        lines.push(format!(
+            "   Sell slip: {}",
+            render_slippage_side_cli(&book.sell_slippage)
+        ));
+    }
     lines.push(format!(
         "   Heuristic outlook: bias={} | position={} | confidence={}",
         position.market_bias, position.position_outlook, position.outlook_confidence

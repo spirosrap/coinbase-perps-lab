@@ -102,6 +102,8 @@ The Rust output now includes additional derived context per position:
 - mark vs index basis
 - 24h price change
 - funding rate and funding direction
+- best bid, best ask, and top-of-book spread
+- live order-book slippage estimates for preset execution sizes
 - liquidation distance and liquidation buffer
 - open interest and max leverage
 - heuristic market bias and position outlook labels
@@ -119,6 +121,10 @@ The dashboard shows the same snapshot in a browser-friendly layout and polls the
 - `open interest` is the total number of open contracts in the market
 - `open interest notional` converts that contract count to quote notional at the current mark
 - `position share of open interest` shows how large your position is relative to the whole market
+- `best bid` and `best ask` are the current top-of-book prices from Coinbase's product book
+- `spread` is the current top-of-book gap between best bid and best ask, shown in absolute terms and basis points
+- `buy slip` and `sell slip` estimate market-order impact for preset quote notionals (`$5k`, `$10k`, `$20k`, `$40k`)
+- slippage is measured against the current best ask for buys and the current best bid for sells, so it reflects incremental execution cost beyond the top level
 - `liqDistance` is the percentage move from the current mark to the estimated liquidation price
 - `market bias` and `position outlook` are heuristic labels derived from 24h price change, basis, funding, entry distance, and liquidation distance
 - `Projections` are simple mark-to-market PnL scenarios, not forecasts
@@ -130,6 +136,22 @@ Projections: +1%=3.07 | +3%=9.20 | -1%=-3.07 | -3%=-9.20
 ```
 
 This means: if the current mark moves up `1%`, the position's unrealized PnL would increase by about `3.07` quote units; if it moves down `3%`, unrealized PnL would decrease by about `9.20`. These projections do not include fees, funding, slippage, or execution effects.
+
+Execution estimates are based on the current Coinbase product-book ladder. Example:
+
+```text
+Execution: bestBid=652.81 | bestAsk=652.88 | spread=0.0700 (1.07 bps) | bookLevels=39/44
+Buy slip: $5k 0.00bps @652.88 | $10k 4.22bps @653.16 | $20k 14.78bps @653.84 | $40k 31.82bps @654.96
+Sell slip: $5k 2.72bps @652.63 | $10k 4.83bps @652.49 | $20k 6.84bps @652.36 | $40k 8.78bps @652.24
+```
+
+This means:
+
+- the current top-of-book spread is about `1.07 bps`
+- buying `$5k` would fully fill at the best ask in this snapshot
+- buying larger size walks up the ask ladder, so average execution price gets worse
+- selling larger size walks down the bid ladder, so average execution price gets worse
+- these are snapshot estimates, not guarantees; they can change before execution
 
 Funding intensity thresholds in this tool are heuristic:
 
@@ -154,16 +176,17 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 2. Authenticates with Coinbase using ES256 JWTs
 3. Fetches available portfolios
 4. Selects the first `INTX` portfolio unless you pass `--portfolio`
-5. Fetches open positions, product metadata, and portfolio summary data
+5. Fetches open positions, product metadata, portfolio summary data, and the live product-book ladder
 6. Computes derived analytics and renders them in either CLI or dashboard form
 
-The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata and portfolio summary data so the output can show additional context without placing trades.
+The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 
 The dashboard uses the same Rust analysis path. Coinbase credentials stay in the local Rust process; the browser only receives the computed snapshot JSON from `http://127.0.0.1:3000/api/snapshot`.
 
 ## Architecture
 
 - The Rust binary uses direct Coinbase REST calls with ES256 JWT authentication
+- Product-book depth is pulled from Coinbase's public `market/product_book` endpoint with `cache-control: no-cache`
 - Both Rust binaries are read-only and target the same INTX portfolio/positions workflow
 - The analytics layer is shared between the CLI and dashboard
 - The heuristic analytics are context, not a predictive trading model
