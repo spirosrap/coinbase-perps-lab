@@ -134,11 +134,12 @@ The dashboard now keeps two time horizons:
 The dashboard also adds a conservative setup layer:
 
 - official Fed monetary-policy headlines from the Federal Reserve RSS feed
-- upcoming FOMC dates from the official FOMC calendar
-- a heuristic event-risk level
+- scheduled macro events from the official FOMC calendar and the White House / OIRA principal economic indicators schedule
+- current coverage includes FOMC, CPI, jobs, PCE, GDP, retail sales, and PPI
+- a heuristic scheduled-macro risk level
 - a heuristic setup status and suggested max leverage per position
 
-This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
+Earnings and geopolitical headlines are not yet scored in the risk model. This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
 ## Interpreting the Rust output
 
@@ -224,7 +225,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
 8. Persists that dashboard history to a local JSON file so it survives restarts
 9. Maintains longer-horizon `5` minute rollups so the dashboard can compare current microstructure against a broader recent baseline
-10. In dashboard mode, loads official Fed policy headlines and FOMC schedule context and derives a conservative setup/leverage assessment
+10. In dashboard mode, loads official Fed policy headlines plus scheduled macro events from the FOMC calendar and White House / OIRA release schedule, then derives a conservative setup/leverage assessment
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 

@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use chrono::{Datelike, NaiveDate, Utc};
 use clap::Parser;
 use coinbase_perps_lab::{load_output, OrderBookSummary, Output, PositionSummary, SlippageEstimate};
+use pdf_extract::extract_text_from_mem;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 const FED_MONETARY_FEED_URL: &str = "https://www.federalreserve.gov/feeds/press_monetary.xml";
 const FED_FOMC_CALENDAR_URL: &str = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm";
+const OMB_PFEI_PDF_URL_PATTERN: &str =
+    "https://www.whitehouse.gov/wp-content/uploads/{upload_year}/09/pfei_schedule_release_dates_cy{year}.pdf";
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -190,11 +193,73 @@ struct OfficialHeadline {
 #[derive(Debug, Serialize, Clone)]
 struct UpcomingEvent {
     source: String,
+    category: String,
     title: String,
     scheduled_for: String,
     days_until: Option<f64>,
     risk: String,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ScheduledMacroSpec {
+    row_name: &'static str,
+    title: &'static str,
+    category: &'static str,
+    source: &'static str,
+    high_window_days: f64,
+    medium_window_days: f64,
+}
+
+const SCHEDULED_MACRO_SPECS: [ScheduledMacroSpec; 6] = [
+    ScheduledMacroSpec {
+        row_name: "Consumer Price Index",
+        title: "Consumer Price Index (CPI)",
+        category: "inflation",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 7.0,
+    },
+    ScheduledMacroSpec {
+        row_name: "The Employment Situation",
+        title: "Employment Situation (Jobs)",
+        category: "labor",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 7.0,
+    },
+    ScheduledMacroSpec {
+        row_name: "Personal Income and Outlays",
+        title: "Personal Income and Outlays (PCE)",
+        category: "inflation",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 7.0,
+    },
+    ScheduledMacroSpec {
+        row_name: "Gross Domestic Product",
+        title: "Gross Domestic Product (GDP)",
+        category: "growth",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 5.0,
+    },
+    ScheduledMacroSpec {
+        row_name: "Advance Monthly Sales for Retail and Food Services",
+        title: "Advance Retail Sales",
+        category: "consumer",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 3.0,
+    },
+    ScheduledMacroSpec {
+        row_name: "Producer Price Indexes",
+        title: "Producer Price Index (PPI)",
+        category: "inflation",
+        source: "White House / OIRA schedule",
+        high_window_days: 1.0,
+        medium_window_days: 3.0,
+    },
+];
 
 #[derive(Debug, Serialize)]
 struct TradeSetupAssessment {
@@ -237,6 +302,22 @@ fn get_text(client: &Client, url: &str) -> Result<String> {
     response
         .text()
         .with_context(|| format!("failed to read text body for GET {url}"))
+}
+
+fn get_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("request failed for GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("remote source returned {status} for GET {url}: {body}");
+    }
+    response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .with_context(|| format!("failed to read binary body for GET {url}"))
 }
 
 fn decode_html_entities(input: &str) -> String {
@@ -306,6 +387,101 @@ fn date_from_month_and_day(year: i32, month_label: &str, day: u32) -> Option<Nai
     NaiveDate::from_ymd_opt(year, month, day)
 }
 
+fn classify_event_risk(days_until: f64, high_window_days: f64, medium_window_days: f64) -> String {
+    if days_until <= high_window_days {
+        "high".to_string()
+    } else if days_until <= medium_window_days {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn pfei_pdf_url_for_year(year: i32) -> String {
+    OMB_PFEI_PDF_URL_PATTERN
+        .replace("{upload_year}", &(year - 1).to_string())
+        .replace("{year}", &year.to_string())
+}
+
+fn parse_pfei_schedule_text(client: &Client, year: i32) -> Result<String> {
+    let url = pfei_pdf_url_for_year(year);
+    let bytes = get_bytes(client, &url)?;
+    extract_text_from_mem(&bytes).with_context(|| format!("failed to extract text from {url}"))
+}
+
+fn extract_indicator_day_tokens(schedule_text: &str, row_name: &str) -> Result<Vec<Option<u32>>> {
+    let start = schedule_text
+        .find(row_name)
+        .with_context(|| format!("failed to locate {row_name} in principal indicators schedule"))?;
+    let end = (start + 600).min(schedule_text.len());
+    let block = &schedule_text[start..end];
+    let quarter_re = Regex::new(r"\b\dQ'\d{2}\b").unwrap();
+    let cleaned = quarter_re.replace_all(block, " ");
+    let token_re = Regex::new(r"\b\d{1,2}\b|--").unwrap();
+
+    let tokens = token_re
+        .find_iter(&cleaned)
+        .map(|item| match item.as_str() {
+            "--" => None,
+            value => value.parse::<u32>().ok(),
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+
+    if tokens.len() < 12 {
+        anyhow::bail!(
+            "expected 12 month tokens for {row_name}, found {}",
+            tokens.len()
+        );
+    }
+
+    Ok(tokens)
+}
+
+fn next_scheduled_release_date(
+    year: i32,
+    month_tokens: &[Option<u32>],
+    today: NaiveDate,
+) -> Option<NaiveDate> {
+    for month in today.month()..=12 {
+        let Some(token) = month_tokens.get(month as usize - 1).copied().flatten() else {
+            continue;
+        };
+        let Some(date) = NaiveDate::from_ymd_opt(year, month, token) else {
+            continue;
+        };
+        if date >= today {
+            return Some(date);
+        }
+    }
+    None
+}
+
+fn parse_scheduled_macro_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
+    let year = Utc::now().year();
+    let today = Utc::now().date_naive();
+    let schedule_text = parse_pfei_schedule_text(client, year)?;
+    let mut events = Vec::new();
+
+    for spec in SCHEDULED_MACRO_SPECS {
+        let month_tokens = extract_indicator_day_tokens(&schedule_text, spec.row_name)?;
+        let Some(date) = next_scheduled_release_date(year, &month_tokens, today) else {
+            continue;
+        };
+        let days_until = (date - today).num_days() as f64;
+        events.push(UpcomingEvent {
+            source: spec.source.to_string(),
+            category: spec.category.to_string(),
+            title: spec.title.to_string(),
+            scheduled_for: date.to_string(),
+            days_until: Some(days_until),
+            risk: classify_event_risk(days_until, spec.high_window_days, spec.medium_window_days),
+        });
+    }
+
+    Ok(events)
+}
+
 fn parse_fomc_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
     let html = get_text(client, FED_FOMC_CALENDAR_URL)?;
     let year_re = Regex::new(r#"<a id="42828">(\d{4}) FOMC Meetings</a>"#).unwrap();
@@ -350,6 +526,7 @@ fn parse_fomc_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
         };
         events.push(UpcomingEvent {
             source: "Federal Reserve".to_string(),
+            category: "policy".to_string(),
             title: format!("FOMC meeting ({month_label} {raw_date})"),
             scheduled_for: date.to_string(),
             days_until: Some(days_until),
@@ -379,16 +556,34 @@ fn load_market_context(client: &Client) -> MarketContext {
             Vec::new()
         }
     };
-    let upcoming_events = match parse_fomc_events(client) {
+    let mut upcoming_events = match parse_fomc_events(client) {
         Ok(items) => items,
         Err(error) => {
             notes.push(format!("FOMC calendar fetch failed: {error:#}"));
             Vec::new()
         }
     };
+    match parse_scheduled_macro_events(client) {
+        Ok(mut items) => upcoming_events.append(&mut items),
+        Err(error) => {
+            notes.push(format!(
+                "Principal indicators schedule fetch failed: {error:#}"
+            ));
+        }
+    }
+    upcoming_events.sort_by(|left, right| left.scheduled_for.cmp(&right.scheduled_for));
+    upcoming_events.truncate(8);
     if notes.is_empty() {
         notes.push(
-            "Market context is currently driven by official Federal Reserve monetary-policy headlines and the FOMC meeting calendar."
+            "Scheduled macro risk is currently derived from the official FOMC calendar and the White House / OIRA principal economic indicators schedule."
+                .to_string(),
+        );
+        notes.push(
+            "This now covers policy plus scheduled CPI, jobs, PCE, GDP, retail sales, and PPI releases."
+                .to_string(),
+        );
+        notes.push(
+            "Earnings and geopolitical headlines are not yet scored in the risk model."
                 .to_string(),
         );
     }
@@ -895,7 +1090,7 @@ fn assess_trade_setup(
             suggested_max_leverage = suggested_max_leverage.min(2.0);
             penalties += 2;
             notes.push(
-                "A scheduled Fed event is close enough that event risk should dominate leverage decisions."
+                "A scheduled macro or policy event is close enough that event risk should dominate leverage decisions."
                     .to_string(),
             );
         }
@@ -903,7 +1098,7 @@ fn assess_trade_setup(
             suggested_max_leverage = suggested_max_leverage.min(3.0);
             penalties += 1;
             notes.push(
-                "A Fed event is within roughly a week, so leverage should stay moderate."
+                "A scheduled macro or policy event is within roughly a week, so leverage should stay moderate."
                     .to_string(),
             );
         }
@@ -1624,7 +1819,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         .map((item) => `<li><a href="${escapeHtml(item.link)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>${item.published_at ? ` <span class="history-meta">${escapeHtml(item.published_at)}</span>` : ""}</li>`)
         .join("");
       const events = (context?.upcoming_events || [])
-        .map((item) => `<li><strong>${escapeHtml(item.title)}</strong><br><span class="history-meta">${escapeHtml(item.scheduled_for)}${item.days_until != null ? ` (${formatMaybe(item.days_until, 1)} days)` : ""} · ${escapeHtml(item.risk)} risk</span></li>`)
+        .map((item) => `<li><strong>${escapeHtml(item.title)}</strong><br><span class="history-meta">${escapeHtml(item.scheduled_for)}${item.days_until != null ? ` (${formatMaybe(item.days_until, 1)} days)` : ""} · ${escapeHtml(item.risk)} risk · ${escapeHtml(item.category)} · ${escapeHtml(item.source)}</span></li>`)
         .join("");
       const notes = (context?.notes || [])
         .map((item) => `<li>${escapeHtml(item)}</li>`)
@@ -1633,16 +1828,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `
         <div class="context-grid">
           <section class="context-panel">
-            <div class="section-title">Market Context</div>
-            <div class="history-value">${escapeHtml(context?.event_risk || "unknown")} event risk</div>
+            <div class="section-title">Scheduled Macro Context</div>
+            <div class="history-value">${escapeHtml(context?.event_risk || "unknown")} scheduled risk</div>
             <ul class="context-list">${notes}</ul>
           </section>
           <section class="context-panel">
-            <div class="section-title">Official Fed Headlines</div>
+            <div class="section-title">Policy Headlines</div>
             <ul class="headline-list">${headlines || "<li>No official headlines loaded.</li>"}</ul>
           </section>
           <section class="context-panel">
-            <div class="section-title">Upcoming Events</div>
+            <div class="section-title">Upcoming Scheduled Events</div>
             <ul class="context-list">${events || "<li>No upcoming official events loaded.</li>"}</ul>
           </section>
         </div>
@@ -1701,7 +1896,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Liq Buffer", pos.liquidation_buffer || "unknown")}
             ${statCard("Max Leverage", pos.max_leverage ? `${escapeHtml(pos.max_leverage)}x` : "unknown")}
             ${statCard("Setup Status", assessment?.alignment_status || "unknown")}
-            ${statCard("Event Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
+            ${statCard("Macro Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
             ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
             ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
           </div>
@@ -1764,7 +1959,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         ),
         metricCard("Credential Source", snapshot.credential_source || "unknown", "compact"),
         metricCard("Setup Status", firstSetup?.alignment_status || "no position"),
-        metricCard("Event Risk", snapshot.market_context?.event_risk || "unknown"),
+        metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
         metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "unknown"),
       ].join("");
