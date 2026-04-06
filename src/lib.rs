@@ -19,7 +19,7 @@ const API_BASE: &str = "https://api.coinbase.com";
 const ORDER_BOOK_LEVEL_LIMIT: usize = 100;
 const SLIPPAGE_NOTIONAL_TARGETS: [f64; 4] = [5_000.0, 10_000.0, 20_000.0, 40_000.0];
 pub const ANALYSIS_BASIS: &str =
-    "Heuristic snapshot derived from Coinbase position, product, portfolio summary, and product book endpoints. Not a predictive model.";
+    "Heuristic snapshot derived from Coinbase position, product, portfolio summary, and product book endpoints. Any dashboard model output is a separate experimental overlay, not a trade guarantee.";
 
 #[derive(Debug, Clone)]
 struct Credentials {

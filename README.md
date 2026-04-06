@@ -115,6 +115,7 @@ The Rust output now includes additional derived context per position:
 - open interest and max leverage
 - heuristic market bias and position outlook labels
 - simple scenario projections for `+1%`, `+3%`, `-1%`, and `-3%` moves from the current mark
+- an experimental 1-hour directional model in the dashboard, which prefers a history-augmented local feature set when enough persisted rollups exist and otherwise falls back to Coinbase public candles only
 
 The dashboard shows the same snapshot in a browser-friendly layout and polls the local backend for refreshes.
 
@@ -146,6 +147,8 @@ The dashboard also adds a conservative setup layer:
 - flat-mode re-entry watch cards for recently tracked symbols
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
+- an experimental 1-hour directional baseline model that trains locally on `5` minute data and shows `P(up in 1h)`, bias, confidence, holdout validation stats, model variant, and edge versus baseline
+- explicit model-data readiness guidance showing collected local history, activation threshold, and longer-horizon trust thresholds
 
 This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
@@ -180,6 +183,20 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - `Projections` are simple mark-to-market PnL scenarios, not forecasts
 - `setup status` combines event risk, execution costs, book skew, and heuristic market bias into a conservative status such as `aligned`, `mixed`, or `avoid aggression`
 - `suggested max leverage` is a conservative cap derived from those same inputs and is meant as a risk-control prompt, not an instruction
+- `Experimental Model` is a separate overlay, not part of the execution gate
+- it runs on a `60` minute horizon with `5` minute bars
+- when enough local persisted rollup history exists, it augments candle features with local microstructure, funding, basis, open-interest-notional, and market-context-risk features
+- otherwise it falls back to a candle-only model and says so explicitly
+- if the chronological holdout does not beat a naive baseline, the model neutralizes itself to `50/50` and reports `no_edge`
+- `Variant` shows whether you are seeing the `history_augmented` or `candle_only` path
+- `Edge vs Base` shows the holdout accuracy delta versus the naive majority-class baseline, in percentage points
+- `History Collected` shows how much persisted 5-minute rollup history the dashboard has for that symbol
+- `Augmented Model` shows whether the richer model is active yet or how much local history is still needed
+- readiness thresholds are:
+- activation at `120` rollup buckets, about `10` hours
+- first review at `300` buckets, about `25` hours
+- serious trust at `960` buckets, about `80` hours
+- treat `P(up 1h)` as experimental context, not a reason by itself to override the risk gate
 
 Example:
 
@@ -246,6 +263,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 10. In dashboard mode, loads cached market context from Fed policy feeds, the White House / OIRA release schedule, a Google News geopolitics headline scan, and an Alpha Vantage equity-earnings proxy when relevant, then derives a conservative combined-risk and setup/leverage assessment
 11. Pulls recent futures/perpetual orders and filters for active orders so the dashboard can show open orders and stale reduce-only cleanup candidates
 12. When no position is open, keeps live watch-market snapshots for recently tracked symbols so the dashboard remains useful in flat mode
+13. Builds an experimental local 1-hour directional model from Coinbase public candles and caches the prediction separately from the heuristic execution gate
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 

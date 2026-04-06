@@ -28,6 +28,15 @@ const MAX_ROLLUP_BUCKETS: usize = 14 * 24 * 12;
 const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 const MARKET_CONTEXT_TTL_MS: u64 = 30 * 60 * 1000;
+const MODEL_PREDICTION_TTL_MS: u64 = 5 * 60 * 1000;
+const MODEL_CANDLE_GRANULARITY: &str = "FIVE_MINUTE";
+const MODEL_GRANULARITY_MINUTES: u32 = 5;
+const MODEL_HORIZON_MINUTES: u32 = 60;
+const MODEL_CANDLE_LIMIT: usize = 350;
+const MODEL_CANDLE_WINDOWS: usize = 6;
+const MODEL_ACTIVATION_ROLLUP_BUCKETS: usize = 120;
+const MODEL_REVIEW_ROLLUP_BUCKETS: usize = 300;
+const MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS: usize = 960;
 const FED_MONETARY_FEED_URL: &str = "https://www.federalreserve.gov/feeds/press_monetary.xml";
 const FED_FOMC_CALENDAR_URL: &str = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm";
 const OMB_PFEI_PDF_URL_PATTERN: &str =
@@ -63,6 +72,7 @@ struct AppState {
     history_file: PathBuf,
     history: Mutex<HashMap<String, PersistedSymbolHistory>>,
     market_context_cache: Mutex<Option<CachedMarketContext>>,
+    prediction_cache: Mutex<HashMap<String, CachedPrediction>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +87,35 @@ struct CachedMarketContext {
     context: MarketContext,
 }
 
+#[derive(Debug, Clone)]
+struct CachedPrediction {
+    loaded_at_ms: u64,
+    history_signature: u64,
+    prediction: ModelPrediction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PositionHistorySample {
     id: String,
     label: String,
     #[serde(default)]
     recorded_at_ms: u64,
+    #[serde(default)]
+    mark_price: Option<f64>,
+    #[serde(default)]
+    price_change_24h_pct: Option<f64>,
+    #[serde(default)]
+    basis_pct: Option<f64>,
+    #[serde(default)]
+    funding_rate_pct: Option<f64>,
+    #[serde(default)]
+    open_interest_notional: Option<f64>,
+    #[serde(default)]
+    event_risk_score: Option<f64>,
+    #[serde(default)]
+    scheduled_risk_score: Option<f64>,
+    #[serde(default)]
+    headline_risk_score: Option<f64>,
     spread_bps: Option<f64>,
     top_5_imbalance_pct: Option<f64>,
     buy_10k_bps: Option<f64>,
@@ -104,11 +137,33 @@ struct HistoryRollupBucket {
     bucket_start_ms: u64,
     label: String,
     sample_count: usize,
+    #[serde(default)]
+    mark_price: RunningMetric,
+    #[serde(default)]
+    price_change_24h_pct: RunningMetric,
+    #[serde(default)]
+    basis_pct: RunningMetric,
+    #[serde(default)]
+    funding_rate_pct: RunningMetric,
+    #[serde(default)]
+    open_interest_notional: RunningMetric,
+    #[serde(default)]
+    event_risk_score: RunningMetric,
+    #[serde(default)]
+    scheduled_risk_score: RunningMetric,
+    #[serde(default)]
+    headline_risk_score: RunningMetric,
+    #[serde(default)]
     spread_bps: RunningMetric,
+    #[serde(default)]
     top_5_imbalance_pct: RunningMetric,
+    #[serde(default)]
     buy_10k_bps: RunningMetric,
+    #[serde(default)]
     buy_40k_bps: RunningMetric,
+    #[serde(default)]
     sell_10k_bps: RunningMetric,
+    #[serde(default)]
     sell_40k_bps: RunningMetric,
 }
 
@@ -152,6 +207,8 @@ struct DashboardSnapshot {
     watch_assessments: HashMap<String, TradeSetupAssessment>,
     watch_entry_checklists: HashMap<String, EntryChecklist>,
     watch_entry_sizing_plans: HashMap<String, EntrySizingPlan>,
+    position_predictions: HashMap<String, ModelPrediction>,
+    watch_predictions: HashMap<String, ModelPrediction>,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,8 +381,59 @@ struct EntrySizingPlan {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ModelPrediction {
+    variant: String,
+    status: String,
+    horizon_minutes: u32,
+    granularity: String,
+    probability_up: Option<f64>,
+    probability_down: Option<f64>,
+    model_bias: String,
+    confidence: String,
+    training_samples: usize,
+    test_samples: usize,
+    test_accuracy: Option<f64>,
+    baseline_accuracy: Option<f64>,
+    edge_vs_baseline_pct_points: Option<f64>,
+    brier_score: Option<f64>,
+    readiness_stage: String,
+    rollup_buckets_collected: usize,
+    rollup_hours_collected: f64,
+    buckets_until_activation: usize,
+    hours_until_activation: f64,
+    summary: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandleResponse {
+    #[serde(default)]
+    candles: Vec<RawCandle>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCandle {
+    start: String,
+    low: String,
+    high: String,
+    open: String,
+    close: String,
+    volume: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandleBar {
+    start: i64,
+    low: f64,
+    high: f64,
+    open: f64,
+    close: f64,
+    volume: f64,
+}
+
 fn history_format_version() -> u32 {
-    2
+    3
 }
 
 fn now_millis() -> u64 {
@@ -333,6 +441,52 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn history_signature(history: Option<&PersistedSymbolHistory>) -> u64 {
+    let Some(history) = history else {
+        return 0;
+    };
+    let recent_latest = history
+        .recent
+        .last()
+        .map(|item| item.recorded_at_ms)
+        .unwrap_or(0);
+    let rollup_latest = history
+        .rollups
+        .last()
+        .map(|item| item.bucket_start_ms)
+        .unwrap_or(0);
+    recent_latest
+        ^ rollup_latest.rotate_left(13)
+        ^ ((history.recent.len() as u64) << 1)
+        ^ ((history.rollups.len() as u64) << 33)
+}
+
+fn rollup_buckets_to_hours(bucket_count: usize) -> f64 {
+    bucket_count as f64 * (ROLLUP_BUCKET_MS as f64 / 3_600_000.0)
+}
+
+fn model_readiness_stage(bucket_count: usize) -> String {
+    if bucket_count >= MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS {
+        "serious".to_string()
+    } else if bucket_count >= MODEL_REVIEW_ROLLUP_BUCKETS {
+        "reviewable".to_string()
+    } else if bucket_count >= MODEL_ACTIVATION_ROLLUP_BUCKETS {
+        "active but immature".to_string()
+    } else {
+        "collecting".to_string()
+    }
+}
+
+fn apply_model_readiness(prediction: &mut ModelPrediction, history: Option<&PersistedSymbolHistory>) {
+    let bucket_count = history.map(|item| item.rollups.len()).unwrap_or(0);
+    let buckets_until_activation = MODEL_ACTIVATION_ROLLUP_BUCKETS.saturating_sub(bucket_count);
+    prediction.readiness_stage = model_readiness_stage(bucket_count);
+    prediction.rollup_buckets_collected = bucket_count;
+    prediction.rollup_hours_collected = rollup_buckets_to_hours(bucket_count);
+    prediction.buckets_until_activation = buckets_until_activation;
+    prediction.hours_until_activation = rollup_buckets_to_hours(buckets_until_activation);
 }
 
 fn format_pct(value: Option<f64>) -> Option<String> {
@@ -380,6 +534,708 @@ fn get_bytes(client: &Client, url: &str) -> Result<Vec<u8>> {
         .bytes()
         .map(|bytes| bytes.to_vec())
         .with_context(|| format!("failed to read binary body for GET {url}"))
+}
+
+fn get_json<T>(client: &Client, url: &str, no_cache: bool) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut request = client.get(url);
+    if no_cache {
+        request = request.header("cache-control", "no-cache");
+    }
+    let response = request
+        .send()
+        .with_context(|| format!("request failed for GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("remote source returned {status} for GET {url}: {body}");
+    }
+    response
+        .json::<T>()
+        .with_context(|| format!("failed to decode JSON body for GET {url}"))
+}
+
+fn parse_number(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok()
+}
+
+fn parse_timestamp(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
+}
+
+fn risk_score(value: &str) -> Option<f64> {
+    match value {
+        "low" => Some(0.0),
+        "medium" => Some(1.0),
+        "high" => Some(2.0),
+        _ => None,
+    }
+}
+
+fn fetch_public_product_candles(client: &Client, product_id: &str) -> Result<Vec<CandleBar>> {
+    let end = Utc::now().timestamp();
+    let span_seconds = MODEL_CANDLE_LIMIT as i64 * MODEL_GRANULARITY_MINUTES as i64 * 60;
+    let mut candles = Vec::new();
+    for window_index in 0..MODEL_CANDLE_WINDOWS {
+        let window_end = end - (window_index as i64 * span_seconds);
+        let window_start = window_end - span_seconds;
+        let url = format!(
+            "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles?start={window_start}&end={window_end}&granularity={MODEL_CANDLE_GRANULARITY}&limit={MODEL_CANDLE_LIMIT}"
+        );
+        let response: CandleResponse = get_json(client, &url, true)?;
+        candles.extend(response.candles.into_iter().filter_map(|item| {
+            Some(CandleBar {
+                start: parse_timestamp(&item.start)?,
+                low: parse_number(&item.low)?,
+                high: parse_number(&item.high)?,
+                open: parse_number(&item.open)?,
+                close: parse_number(&item.close)?,
+                volume: parse_number(&item.volume).unwrap_or(0.0),
+            })
+        }));
+    }
+    candles.sort_by_key(|item| item.start);
+    candles.dedup_by_key(|item| item.start);
+    Ok(candles)
+}
+
+fn rolling_mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then_some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn rolling_std(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let mean = rolling_mean(values)?;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    Some(variance.sqrt())
+}
+
+fn sigmoid(value: f64) -> f64 {
+    if value >= 0.0 {
+        let z = (-value).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = value.exp();
+        z / (1.0 + z)
+    }
+}
+
+fn dot(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>()
+}
+
+fn candle_index_at_or_before(candles: &[CandleBar], timestamp: i64) -> Option<usize> {
+    match candles.binary_search_by_key(&timestamp, |item| item.start) {
+        Ok(index) => Some(index),
+        Err(0) => None,
+        Err(index) => Some(index.saturating_sub(1)),
+    }
+}
+
+fn recent_log_returns(candles: &[CandleBar], index: usize, lookback: usize) -> Option<Vec<f64>> {
+    let returns = candles
+        .get(index + 1 - lookback..=index)?
+        .windows(2)
+        .filter_map(|window| {
+            let left = window.first()?.close;
+            let right = window.get(1)?.close;
+            (left > 0.0 && right > 0.0).then_some((right / left).ln())
+        })
+        .collect::<Vec<_>>();
+    Some(returns)
+}
+
+fn candle_feature_vector(candles: &[CandleBar], index: usize) -> Option<Vec<f64>> {
+    if index < 48 || index == 0 {
+        return None;
+    }
+    let close = candles.get(index)?.close;
+    let prev_close = candles.get(index - 1)?.close;
+    let close_3 = candles.get(index - 3)?.close;
+    let close_12 = candles.get(index - 12)?.close;
+    let close_48 = candles.get(index - 48)?.close;
+    let recent_12 = candles
+        .get(index + 1 - 12..=index)?
+        .iter()
+        .map(|item| item.close)
+        .collect::<Vec<_>>();
+    let recent_48 = candles
+        .get(index + 1 - 48..=index)?
+        .iter()
+        .map(|item| item.close)
+        .collect::<Vec<_>>();
+    let returns_12 = recent_log_returns(candles, index, 12)?;
+    let returns_48 = recent_log_returns(candles, index, 48)?;
+    let candle = candles.get(index)?;
+    let sma_12 = rolling_mean(&recent_12)?;
+    let sma_48 = rolling_mean(&recent_48)?;
+    let vol_12 = rolling_std(&returns_12).unwrap_or(0.0);
+    let vol_48 = rolling_std(&returns_48).unwrap_or(0.0);
+    let avg_volume_48 = candles
+        .get(index + 1 - 48..=index)?
+        .iter()
+        .map(|item| item.volume)
+        .sum::<f64>()
+        / 48.0;
+    let volume_ratio = if avg_volume_48 > 0.0 {
+        candle.volume / avg_volume_48 - 1.0
+    } else {
+        0.0
+    };
+
+    Some(vec![
+        close / prev_close - 1.0,
+        close / close_3 - 1.0,
+        close / close_12 - 1.0,
+        close / close_48 - 1.0,
+        close / sma_12 - 1.0,
+        close / sma_48 - 1.0,
+        vol_12,
+        vol_48,
+        if candle.close > 0.0 {
+            (candle.high - candle.low) / candle.close
+        } else {
+            0.0
+        },
+        if candle.open > 0.0 {
+            candle.close / candle.open - 1.0
+        } else {
+            0.0
+        },
+        volume_ratio,
+    ])
+}
+
+fn rollup_feature_vector(
+    history: &PersistedSymbolHistory,
+    candles: &[CandleBar],
+    index: usize,
+) -> Option<(Vec<f64>, usize)> {
+    let bucket = history.rollups.get(index)?;
+    let candle_index =
+        candle_index_at_or_before(candles, (bucket.bucket_start_ms / 1000) as i64)?;
+    let mut features = candle_feature_vector(candles, candle_index)?;
+    features.push(bucket.spread_bps.average().unwrap_or(0.0));
+    features.push(bucket.top_5_imbalance_pct.average().unwrap_or(0.0) / 100.0);
+    features.push(bucket.buy_10k_bps.average().unwrap_or(0.0));
+    features.push(bucket.buy_40k_bps.average().unwrap_or(0.0));
+    features.push(bucket.sell_10k_bps.average().unwrap_or(0.0));
+    features.push(bucket.sell_40k_bps.average().unwrap_or(0.0));
+    features.push(bucket.basis_pct.average().unwrap_or(0.0) / 100.0);
+    features.push(bucket.funding_rate_pct.average().unwrap_or(0.0) / 100.0);
+    features.push(bucket.price_change_24h_pct.average().unwrap_or(0.0) / 100.0);
+    features.push(bucket.open_interest_notional.average().unwrap_or(0.0).ln_1p());
+    features.push(bucket.event_risk_score.average().unwrap_or(0.0) / 2.0);
+    features.push(bucket.scheduled_risk_score.average().unwrap_or(0.0) / 2.0);
+    features.push(bucket.headline_risk_score.average().unwrap_or(0.0) / 2.0);
+    let bucket_mark = bucket.mark_price.average().unwrap_or(0.0);
+    let candle_close = candles.get(candle_index)?.close;
+    features.push(if bucket_mark > 0.0 {
+        candle_close / bucket_mark - 1.0
+    } else {
+        0.0
+    });
+    Some((features, candle_index))
+}
+
+fn classify_model_confidence(probability_up: f64, test_accuracy: Option<f64>, baseline_accuracy: Option<f64>) -> String {
+    let edge = (probability_up - 0.5).abs();
+    let accuracy_edge = test_accuracy
+        .zip(baseline_accuracy)
+        .map(|(test, base)| test - base)
+        .unwrap_or(0.0);
+    if edge >= 0.12 && accuracy_edge >= 0.04 {
+        "high".to_string()
+    } else if edge >= 0.07 && accuracy_edge >= 0.02 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn classify_model_bias(probability_up: f64, confidence: &str) -> String {
+    if confidence == "low" || (0.47..=0.53).contains(&probability_up) {
+        "neutral".to_string()
+    } else if probability_up >= 0.53 {
+        "bullish".to_string()
+    } else {
+        "bearish".to_string()
+    }
+}
+
+fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -> Result<ModelPrediction> {
+    let horizon_bars = (MODEL_HORIZON_MINUTES / MODEL_GRANULARITY_MINUTES) as usize;
+    if candles.len() < 120 || horizon_bars == 0 {
+        return Ok(ModelPrediction {
+            variant: "candle_only".to_string(),
+            status: "not_enough_data".to_string(),
+            horizon_minutes: MODEL_HORIZON_MINUTES,
+            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            probability_up: None,
+            probability_down: None,
+            model_bias: "unknown".to_string(),
+            confidence: "low".to_string(),
+            training_samples: 0,
+            test_samples: 0,
+            test_accuracy: None,
+            baseline_accuracy: None,
+            edge_vs_baseline_pct_points: None,
+            brier_score: None,
+            readiness_stage: "collecting".to_string(),
+            rollup_buckets_collected: 0,
+            rollup_hours_collected: 0.0,
+            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+            summary: "Not enough candle history is available to build the experimental baseline.".to_string(),
+            notes: vec!["The fallback candle-only model needs several days of 5-minute candles to train and evaluate.".to_string()],
+        });
+    }
+
+    let mut features = Vec::<Vec<f64>>::new();
+    let mut labels = Vec::<f64>::new();
+    for index in 48..candles.len().saturating_sub(horizon_bars) {
+        let Some(vector) = candle_feature_vector(candles, index) else {
+            continue;
+        };
+        let future_close = candles.get(index + horizon_bars).map(|item| item.close).unwrap_or(0.0);
+        let current_close = candles.get(index).map(|item| item.close).unwrap_or(0.0);
+        if current_close <= 0.0 || future_close <= 0.0 {
+            continue;
+        }
+        features.push(vector);
+        labels.push((future_close > current_close) as u8 as f64);
+    }
+
+    if features.len() < 120 {
+        return Ok(ModelPrediction {
+            variant: "candle_only".to_string(),
+            status: "not_enough_data".to_string(),
+            horizon_minutes: MODEL_HORIZON_MINUTES,
+            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            probability_up: None,
+            probability_down: None,
+            model_bias: "unknown".to_string(),
+            confidence: "low".to_string(),
+            training_samples: features.len(),
+            test_samples: 0,
+            test_accuracy: None,
+            baseline_accuracy: None,
+            edge_vs_baseline_pct_points: None,
+            brier_score: None,
+            readiness_stage: "collecting".to_string(),
+            rollup_buckets_collected: 0,
+            rollup_hours_collected: 0.0,
+            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+            summary: "Not enough feature/label examples are available yet for the experimental model.".to_string(),
+            notes: vec!["The fallback candle-only model discards a longer warm-up window to compute multi-horizon momentum and volatility features.".to_string()],
+        });
+    }
+
+    let split_index = ((features.len() as f64) * 0.8).floor() as usize;
+    let split_index = split_index.clamp(80, features.len().saturating_sub(24));
+    let train_x = &features[..split_index];
+    let train_y = &labels[..split_index];
+    let test_x = &features[split_index..];
+    let test_y = &labels[split_index..];
+    let feature_count = train_x.first().map(|row| row.len()).unwrap_or(0);
+
+    let mut means = vec![0.0; feature_count];
+    let mut stds = vec![1.0; feature_count];
+    for feature_index in 0..feature_count {
+        let column = train_x
+            .iter()
+            .map(|row| row[feature_index])
+            .collect::<Vec<_>>();
+        means[feature_index] = rolling_mean(&column).unwrap_or(0.0);
+        stds[feature_index] = rolling_std(&column).filter(|value| *value > 1e-9).unwrap_or(1.0);
+    }
+
+    let normalize = |row: &[f64]| -> Vec<f64> {
+        row.iter()
+            .enumerate()
+            .map(|(index, value)| (value - means[index]) / stds[index])
+            .collect()
+    };
+
+    let train_x = train_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
+    let test_x = test_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
+
+    let mut weights = vec![0.0; feature_count];
+    let mut bias = 0.0;
+    let learning_rate = 0.12;
+    let l2 = 0.0005;
+    for _ in 0..700 {
+        let mut grad_w = vec![0.0; feature_count];
+        let mut grad_b = 0.0;
+        for (row, label) in train_x.iter().zip(train_y.iter()) {
+            let prediction = sigmoid(dot(&weights, row) + bias);
+            let error = prediction - label;
+            for (index, value) in row.iter().enumerate() {
+                grad_w[index] += error * value;
+            }
+            grad_b += error;
+        }
+        let n = train_x.len() as f64;
+        for index in 0..feature_count {
+            grad_w[index] = grad_w[index] / n + l2 * weights[index];
+            weights[index] -= learning_rate * grad_w[index];
+        }
+        bias -= learning_rate * (grad_b / n);
+    }
+
+    let mut correct = 0usize;
+    let mut positives = 0usize;
+    let mut squared_error = 0.0;
+    for (row, label) in test_x.iter().zip(test_y.iter()) {
+        let probability = sigmoid(dot(&weights, row) + bias);
+        let predicted = (probability >= 0.5) as u8 as f64;
+        if (predicted - label).abs() < f64::EPSILON {
+            correct += 1;
+        }
+        if *label >= 0.5 {
+            positives += 1;
+        }
+        squared_error += (probability - label).powi(2);
+    }
+    let test_accuracy = (!test_y.is_empty()).then_some(correct as f64 / test_y.len() as f64);
+    let baseline_accuracy = (!test_y.is_empty()).then_some(
+        (positives.max(test_y.len().saturating_sub(positives)) as f64) / test_y.len() as f64,
+    );
+    let brier_score = (!test_y.is_empty()).then_some(squared_error / test_y.len() as f64);
+
+    let latest_features = candle_feature_vector(candles, candles.len() - 1)
+        .context("failed to build latest candle-only feature vector")?;
+    let latest_features = normalize(&latest_features);
+    let raw_probability_up = sigmoid(dot(&weights, &latest_features) + bias);
+    let validation_edge = test_accuracy
+        .zip(baseline_accuracy)
+        .map(|(test, base)| test - base)
+        .unwrap_or(0.0);
+    let has_edge = validation_edge > 0.0;
+    let probability_up = if has_edge {
+        raw_probability_up.clamp(0.05, 0.95)
+    } else {
+        0.5
+    };
+    let probability_down = 1.0 - probability_up;
+    let confidence = classify_model_confidence(probability_up, test_accuracy, baseline_accuracy);
+    let model_bias = classify_model_bias(probability_up, &confidence);
+    let status = if has_edge { "available" } else { "no_edge" }.to_string();
+
+    let mut notes = vec![format!(
+        "Experimental baseline trained on {} candle-only {}-minute examples with a {}-minute horizon.",
+        features.len(),
+        MODEL_GRANULARITY_MINUTES,
+        MODEL_HORIZON_MINUTES
+    )];
+    if let (Some(test), Some(base)) = (test_accuracy, baseline_accuracy) {
+        notes.push(format!(
+            "Chronological holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
+            test * 100.0,
+            base * 100.0
+        ));
+    }
+    if has_edge {
+        notes.push(format!(
+            "The current probability is only exposed directionally because the model is ahead of baseline by {:.1} percentage points on the holdout window.",
+            validation_edge * 100.0
+        ));
+    } else {
+        notes.push(
+            "The raw model fit does not currently beat a naive holdout baseline, so the directional output is neutralized to 50/50."
+                .to_string(),
+        );
+    }
+    notes.push(
+        "Inputs are limited to Coinbase public candle price/volatility/volume features. Local microstructure and market-context history are not yet available in sufficient depth."
+            .to_string(),
+    );
+
+    Ok(ModelPrediction {
+        variant: "candle_only".to_string(),
+        status,
+        horizon_minutes: MODEL_HORIZON_MINUTES,
+        granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+        probability_up: Some(probability_up),
+        probability_down: Some(probability_down),
+        model_bias: model_bias.clone(),
+        confidence,
+        training_samples: train_x.len(),
+        test_samples: test_x.len(),
+        test_accuracy,
+        baseline_accuracy,
+        edge_vs_baseline_pct_points: test_accuracy.zip(baseline_accuracy).map(|(test, base)| (test - base) * 100.0),
+        brier_score,
+        readiness_stage: "collecting".to_string(),
+        rollup_buckets_collected: 0,
+        rollup_hours_collected: 0.0,
+        buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+        hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+        summary: if has_edge {
+            format!(
+                "Experimental baseline estimates a {:.1}% probability that {product_id} is higher in {} minutes.",
+                probability_up * 100.0,
+                MODEL_HORIZON_MINUTES
+            )
+        } else {
+            format!(
+                "Experimental baseline does not currently beat a naive holdout baseline for {product_id}; no directional edge is exposed."
+            )
+        },
+        notes,
+    })
+}
+
+fn build_history_augmented_model_prediction(
+    history: &PersistedSymbolHistory,
+    candles: &[CandleBar],
+    product_id: &str,
+) -> Result<Option<ModelPrediction>> {
+    let horizon_bars = (MODEL_HORIZON_MINUTES / MODEL_GRANULARITY_MINUTES) as usize;
+    let mut features = Vec::<Vec<f64>>::new();
+    let mut labels = Vec::<f64>::new();
+    let mut latest_features = None;
+
+    for rollup_index in 0..history.rollups.len() {
+        let Some((vector, candle_index)) = rollup_feature_vector(history, candles, rollup_index) else {
+            continue;
+        };
+        if candle_index + horizon_bars >= candles.len() {
+            latest_features = Some(vector);
+            continue;
+        }
+        let current_close = candles.get(candle_index).map(|item| item.close).unwrap_or(0.0);
+        let future_close = candles
+            .get(candle_index + horizon_bars)
+            .map(|item| item.close)
+            .unwrap_or(0.0);
+        if current_close <= 0.0 || future_close <= 0.0 {
+            continue;
+        }
+        if rollup_index + 1 == history.rollups.len() {
+            latest_features = Some(vector.clone());
+        }
+        features.push(vector);
+        labels.push((future_close > current_close) as u8 as f64);
+    }
+
+    let Some(latest_features) = latest_features else {
+        return Ok(None);
+    };
+    if features.len() < 120 {
+        return Ok(None);
+    }
+
+    let mut prediction =
+        build_candle_only_model_prediction(candles, product_id).unwrap_or_else(|_| ModelPrediction {
+            variant: "candle_only".to_string(),
+            status: "not_enough_data".to_string(),
+            horizon_minutes: MODEL_HORIZON_MINUTES,
+            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            probability_up: None,
+            probability_down: None,
+            model_bias: "unknown".to_string(),
+            confidence: "low".to_string(),
+            training_samples: 0,
+            test_samples: 0,
+            test_accuracy: None,
+            baseline_accuracy: None,
+            edge_vs_baseline_pct_points: None,
+            brier_score: None,
+            readiness_stage: "collecting".to_string(),
+            rollup_buckets_collected: 0,
+            rollup_hours_collected: 0.0,
+            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+            summary: String::new(),
+            notes: Vec::new(),
+        });
+
+    let split_index = ((features.len() as f64) * 0.8).floor() as usize;
+    let split_index = split_index.clamp(80, features.len().saturating_sub(24));
+    let train_x = &features[..split_index];
+    let train_y = &labels[..split_index];
+    let test_x = &features[split_index..];
+    let test_y = &labels[split_index..];
+    let feature_count = train_x.first().map(|row| row.len()).unwrap_or(0);
+
+    let mut means = vec![0.0; feature_count];
+    let mut stds = vec![1.0; feature_count];
+    for feature_index in 0..feature_count {
+        let column = train_x
+            .iter()
+            .map(|row| row[feature_index])
+            .collect::<Vec<_>>();
+        means[feature_index] = rolling_mean(&column).unwrap_or(0.0);
+        stds[feature_index] = rolling_std(&column).filter(|value| *value > 1e-9).unwrap_or(1.0);
+    }
+
+    let normalize = |row: &[f64]| -> Vec<f64> {
+        row.iter()
+            .enumerate()
+            .map(|(index, value)| (value - means[index]) / stds[index])
+            .collect()
+    };
+
+    let train_x = train_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
+    let test_x = test_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
+    let latest_features = normalize(&latest_features);
+
+    let mut weights = vec![0.0; feature_count];
+    let mut bias = 0.0;
+    let learning_rate = 0.12;
+    let l2 = 0.0005;
+    for _ in 0..700 {
+        let mut grad_w = vec![0.0; feature_count];
+        let mut grad_b = 0.0;
+        for (row, label) in train_x.iter().zip(train_y.iter()) {
+            let probability = sigmoid(dot(&weights, row) + bias);
+            let error = probability - label;
+            for (index, value) in row.iter().enumerate() {
+                grad_w[index] += error * value;
+            }
+            grad_b += error;
+        }
+        let n = train_x.len() as f64;
+        for index in 0..feature_count {
+            grad_w[index] = grad_w[index] / n + l2 * weights[index];
+            weights[index] -= learning_rate * grad_w[index];
+        }
+        bias -= learning_rate * (grad_b / n);
+    }
+
+    let mut correct = 0usize;
+    let mut positives = 0usize;
+    let mut squared_error = 0.0;
+    for (row, label) in test_x.iter().zip(test_y.iter()) {
+        let probability = sigmoid(dot(&weights, row) + bias);
+        let predicted = (probability >= 0.5) as u8 as f64;
+        if (predicted - label).abs() < f64::EPSILON {
+            correct += 1;
+        }
+        if *label >= 0.5 {
+            positives += 1;
+        }
+        squared_error += (probability - label).powi(2);
+    }
+    let test_accuracy = (!test_y.is_empty()).then_some(correct as f64 / test_y.len() as f64);
+    let baseline_accuracy = (!test_y.is_empty()).then_some(
+        (positives.max(test_y.len().saturating_sub(positives)) as f64) / test_y.len() as f64,
+    );
+    let brier_score = (!test_y.is_empty()).then_some(squared_error / test_y.len() as f64);
+    let raw_probability_up = sigmoid(dot(&weights, &latest_features) + bias);
+    let validation_edge = test_accuracy
+        .zip(baseline_accuracy)
+        .map(|(test, base)| test - base)
+        .unwrap_or(0.0);
+    let has_edge = validation_edge > 0.0;
+    let probability_up = if has_edge {
+        raw_probability_up.clamp(0.05, 0.95)
+    } else {
+        0.5
+    };
+    let probability_down = 1.0 - probability_up;
+    let confidence = classify_model_confidence(probability_up, test_accuracy, baseline_accuracy);
+    let model_bias = classify_model_bias(probability_up, &confidence);
+    let status = if has_edge { "available" } else { "no_edge" }.to_string();
+
+    prediction.status = status;
+    prediction.variant = "history_augmented".to_string();
+    prediction.probability_up = Some(probability_up);
+    prediction.probability_down = Some(probability_down);
+    prediction.model_bias = model_bias;
+    prediction.confidence = confidence;
+    prediction.training_samples = train_x.len();
+    prediction.test_samples = test_x.len();
+    prediction.test_accuracy = test_accuracy;
+    prediction.baseline_accuracy = baseline_accuracy;
+    prediction.edge_vs_baseline_pct_points =
+        test_accuracy.zip(baseline_accuracy).map(|(test, base)| (test - base) * 100.0);
+    prediction.brier_score = brier_score;
+    prediction.summary = if has_edge {
+        format!(
+            "History-augmented baseline estimates a {:.1}% probability that {product_id} is higher in {} minutes.",
+            probability_up * 100.0,
+            MODEL_HORIZON_MINUTES
+        )
+    } else {
+        format!(
+            "History-augmented baseline does not currently beat a naive holdout baseline for {product_id}; no directional edge is exposed."
+        )
+    };
+    prediction.notes = vec![
+        format!(
+            "History-augmented baseline trained on {} locally persisted 5-minute rollup examples with a {}-minute horizon.",
+            features.len(),
+            MODEL_HORIZON_MINUTES
+        ),
+        format!(
+            "Features combine local rollup microstructure, funding, basis, open interest, and market-context risk scores with Coinbase public 5-minute candle momentum/volatility."
+        ),
+        format!(
+            "Chronological holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
+            test_accuracy.unwrap_or(0.0) * 100.0,
+            baseline_accuracy.unwrap_or(0.0) * 100.0
+        ),
+        if has_edge {
+            format!(
+                "The model is ahead of baseline by {:.1} percentage points on the holdout window.",
+                validation_edge * 100.0
+            )
+        } else {
+            "The raw model fit does not currently beat a naive holdout baseline, so the directional output is neutralized to 50/50."
+                .to_string()
+        },
+        "This model should improve as the dashboard keeps collecting richer local history across more sessions and regimes."
+            .to_string(),
+    ];
+
+    Ok(Some(prediction))
+}
+
+fn build_model_prediction(
+    client: &Client,
+    product_id: &str,
+    history: Option<&PersistedSymbolHistory>,
+) -> Result<ModelPrediction> {
+    let candles = fetch_public_product_candles(client, product_id)?;
+    if let Some(history) = history {
+        if let Some(prediction) = build_history_augmented_model_prediction(history, &candles, product_id)? {
+            let mut prediction = prediction;
+            apply_model_readiness(&mut prediction, Some(history));
+            return Ok(prediction);
+        }
+    }
+    let mut prediction = build_candle_only_model_prediction(&candles, product_id)?;
+    apply_model_readiness(&mut prediction, history);
+    if prediction.status != "not_enough_data" {
+        let rollup_count = history.map(|item| item.rollups.len()).unwrap_or(0);
+        prediction.notes.push(format!(
+            "The richer history-augmented model is not active yet because there are only {rollup_count} persisted local rollup buckets. Keep the dashboard running across more sessions to build that dataset."
+        ));
+        prediction.notes.push(format!(
+            "Activation threshold is {} rollup buckets (~{:.1}h). Early review starts around {} buckets (~{:.1}h), and serious trust starts around {} buckets (~{:.1}h).",
+            MODEL_ACTIVATION_ROLLUP_BUCKETS,
+            rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+            MODEL_REVIEW_ROLLUP_BUCKETS,
+            rollup_buckets_to_hours(MODEL_REVIEW_ROLLUP_BUCKETS),
+            MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS,
+            rollup_buckets_to_hours(MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS),
+        ));
+    }
+    Ok(prediction)
 }
 
 fn decode_html_entities(input: &str) -> String {
@@ -812,6 +1668,61 @@ fn build_market_context_scope(output: &Output) -> MarketContextScope {
     }
 }
 
+fn load_prediction_for_symbol(
+    cache: &Mutex<HashMap<String, CachedPrediction>>,
+    symbol: &str,
+    history: Option<&PersistedSymbolHistory>,
+) -> Result<ModelPrediction> {
+    let history_signature = history_signature(history);
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(symbol) {
+            if entry.history_signature == history_signature
+                && now_millis().saturating_sub(entry.loaded_at_ms) <= MODEL_PREDICTION_TTL_MS
+            {
+                return Ok(entry.prediction.clone());
+            }
+        }
+    }
+
+    let client = build_http_client()?;
+    let prediction = build_model_prediction(&client, symbol, history).unwrap_or_else(|error| ModelPrediction {
+        variant: "error".to_string(),
+        status: "error".to_string(),
+        horizon_minutes: MODEL_HORIZON_MINUTES,
+        granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+        probability_up: None,
+        probability_down: None,
+        model_bias: "unknown".to_string(),
+        confidence: "low".to_string(),
+        training_samples: 0,
+        test_samples: 0,
+        test_accuracy: None,
+        baseline_accuracy: None,
+        edge_vs_baseline_pct_points: None,
+        brier_score: None,
+        readiness_stage: "collecting".to_string(),
+        rollup_buckets_collected: 0,
+        rollup_hours_collected: 0.0,
+        buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+        hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+        summary: "The experimental model could not be computed for this symbol.".to_string(),
+        notes: vec![format!("Prediction build failed: {error:#}")],
+    });
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            symbol.to_string(),
+            CachedPrediction {
+                loaded_at_ms: now_millis(),
+                history_signature,
+                prediction: prediction.clone(),
+            },
+        );
+    }
+
+    Ok(prediction)
+}
+
 fn load_market_context(client: &Client, scope: &MarketContextScope) -> MarketContext {
     let mut notes = Vec::new();
     let mut headlines = match parse_fed_headlines(client) {
@@ -934,6 +1845,14 @@ fn push_sample_into_rollups(rollups: &mut Vec<HistoryRollupBucket>, sample: &Pos
     {
         if let Some(bucket) = rollups.last_mut() {
             bucket.sample_count += 1;
+            bucket.mark_price.push(sample.mark_price);
+            bucket.price_change_24h_pct.push(sample.price_change_24h_pct);
+            bucket.basis_pct.push(sample.basis_pct);
+            bucket.funding_rate_pct.push(sample.funding_rate_pct);
+            bucket.open_interest_notional.push(sample.open_interest_notional);
+            bucket.event_risk_score.push(sample.event_risk_score);
+            bucket.scheduled_risk_score.push(sample.scheduled_risk_score);
+            bucket.headline_risk_score.push(sample.headline_risk_score);
             bucket.spread_bps.push(sample.spread_bps);
             bucket.top_5_imbalance_pct.push(sample.top_5_imbalance_pct);
             bucket.buy_10k_bps.push(sample.buy_10k_bps);
@@ -948,6 +1867,14 @@ fn push_sample_into_rollups(rollups: &mut Vec<HistoryRollupBucket>, sample: &Pos
         bucket_start_ms: bucket_start,
         label: rollup_label(sample),
         sample_count: 0,
+        mark_price: RunningMetric::default(),
+        price_change_24h_pct: RunningMetric::default(),
+        basis_pct: RunningMetric::default(),
+        funding_rate_pct: RunningMetric::default(),
+        open_interest_notional: RunningMetric::default(),
+        event_risk_score: RunningMetric::default(),
+        scheduled_risk_score: RunningMetric::default(),
+        headline_risk_score: RunningMetric::default(),
         spread_bps: RunningMetric::default(),
         top_5_imbalance_pct: RunningMetric::default(),
         buy_10k_bps: RunningMetric::default(),
@@ -956,6 +1883,14 @@ fn push_sample_into_rollups(rollups: &mut Vec<HistoryRollupBucket>, sample: &Pos
         sell_40k_bps: RunningMetric::default(),
     };
     bucket.sample_count += 1;
+    bucket.mark_price.push(sample.mark_price);
+    bucket.price_change_24h_pct.push(sample.price_change_24h_pct);
+    bucket.basis_pct.push(sample.basis_pct);
+    bucket.funding_rate_pct.push(sample.funding_rate_pct);
+    bucket.open_interest_notional.push(sample.open_interest_notional);
+    bucket.event_risk_score.push(sample.event_risk_score);
+    bucket.scheduled_risk_score.push(sample.scheduled_risk_score);
+    bucket.headline_risk_score.push(sample.headline_risk_score);
     bucket.spread_bps.push(sample.spread_bps);
     bucket.top_5_imbalance_pct.push(sample.top_5_imbalance_pct);
     bucket.buy_10k_bps.push(sample.buy_10k_bps);
@@ -1069,11 +2004,27 @@ fn sample_id(book: Option<&OrderBookSummary>) -> String {
         .unwrap_or_else(|| sample_label(book))
 }
 
-fn history_sample_for_symbol(_symbol: &str, book: &OrderBookSummary) -> PositionHistorySample {
+fn history_sample_for_symbol(
+    book: &OrderBookSummary,
+    mark_price: Option<f64>,
+    price_change_24h_pct: Option<f64>,
+    basis_pct: Option<f64>,
+    funding_rate_pct: Option<f64>,
+    open_interest_notional: Option<f64>,
+    market_context: &MarketContext,
+) -> PositionHistorySample {
     PositionHistorySample {
         id: sample_id(Some(book)),
         label: sample_label(Some(book)),
         recorded_at_ms: now_millis(),
+        mark_price,
+        price_change_24h_pct,
+        basis_pct,
+        funding_rate_pct,
+        open_interest_notional,
+        event_risk_score: risk_score(&market_context.event_risk),
+        scheduled_risk_score: risk_score(&market_context.scheduled_risk),
+        headline_risk_score: risk_score(&market_context.headline_risk),
         spread_bps: book.spread_bps,
         top_5_imbalance_pct: book.top_5_imbalance_pct,
         buy_10k_bps: find_slippage_bps(&book.buy_slippage, 10_000.0),
@@ -1104,30 +2055,51 @@ fn upsert_history_sample(
     }
 }
 
-fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
+fn history_sample(
+    position: &PositionSummary,
+    market_context: &MarketContext,
+) -> Option<PositionHistorySample> {
     let book = position.order_book.as_ref()?;
-    Some(history_sample_for_symbol(&position.symbol, book))
+    Some(history_sample_for_symbol(
+        book,
+        position.mark_price.as_deref().and_then(parse_number),
+        position.price_change_24h_pct,
+        position.basis_pct,
+        position.funding_rate_pct,
+        position.open_interest_notional,
+        market_context,
+    ))
 }
 
-fn watch_history_sample(watch: &WatchMarketSummary) -> Option<PositionHistorySample> {
+fn watch_history_sample(
+    watch: &WatchMarketSummary,
+    market_context: &MarketContext,
+) -> Option<PositionHistorySample> {
     let book = watch.order_book.as_ref()?;
-    Some(PositionHistorySample {
-        ..history_sample_for_symbol(&watch.symbol, book)
-    })
+    Some(history_sample_for_symbol(
+        book,
+        watch.mark_price.as_deref().and_then(parse_number),
+        watch.price_change_24h_pct,
+        watch.basis_pct,
+        watch.funding_rate_pct,
+        watch.open_interest_notional,
+        market_context,
+    ))
 }
 
 fn upsert_history(
     history: &mut HashMap<String, PersistedSymbolHistory>,
     output: &Output,
+    market_context: &MarketContext,
 ) -> HashMap<String, PositionHistorySummary> {
     for position in &output.positions {
-        let Some(sample) = history_sample(position) else {
+        let Some(sample) = history_sample(position, market_context) else {
             continue;
         };
         upsert_history_sample(history, &position.symbol, sample);
     }
     for watch in &output.watch_markets {
-        let Some(sample) = watch_history_sample(watch) else {
+        let Some(sample) = watch_history_sample(watch, market_context) else {
             continue;
         };
         upsert_history_sample(history, &watch.symbol, sample);
@@ -2550,7 +3522,67 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function watchCard(watch, history, assessment, checklist, sizingPlan) {
+    function predictionPanel(prediction) {
+      if (!prediction) {
+        return `
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Experimental Model</h2>
+                <div class="subtext">No model output is available yet.</div>
+              </div>
+            </div>
+          </section>
+        `;
+      }
+
+      const notes = (prediction.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+      const up = prediction.probability_up != null ? `${formatMaybe(prediction.probability_up * 100, 1)}%` : "unknown";
+      const down = prediction.probability_down != null ? `${formatMaybe(prediction.probability_down * 100, 1)}%` : "unknown";
+      const testAcc = prediction.test_accuracy != null ? `${formatMaybe(prediction.test_accuracy * 100, 1)}%` : "unknown";
+      const baseAcc = prediction.baseline_accuracy != null ? `${formatMaybe(prediction.baseline_accuracy * 100, 1)}%` : "unknown";
+      const edgeVsBaseline = prediction.edge_vs_baseline_pct_points != null ? `${formatSigned(prediction.edge_vs_baseline_pct_points, 1)} pts` : "unknown";
+      const brier = prediction.brier_score != null ? formatMaybe(prediction.brier_score, 3) : "unknown";
+      const collected = `${formatMaybe(prediction.rollup_hours_collected, 1)}h`;
+      const activationEta = prediction.buckets_until_activation > 0
+        ? `${formatMaybe(prediction.hours_until_activation, 1)}h left`
+        : "active";
+
+      return `
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Experimental Model</h2>
+              <div class="subtext">${escapeHtml(prediction.summary || "")}</div>
+            </div>
+            <div class="badges">
+              <span class="badge ${badgeClass(prediction.model_bias)}">${escapeHtml(prediction.model_bias || "unknown")}</span>
+              <span class="badge neutral">${escapeHtml(prediction.confidence || "low")} confidence</span>
+              <span class="badge ${badgeClass(prediction.readiness_stage || "neutral")}">${escapeHtml(prediction.readiness_stage || "collecting")}</span>
+            </div>
+          </div>
+          <div class="stats-grid">
+            ${statCard("P Up 1h", up, toneClass(prediction.probability_up != null ? prediction.probability_up - 0.5 : null))}
+            ${statCard("P Down 1h", down, toneClass(prediction.probability_down != null ? prediction.probability_down - 0.5 : null))}
+            ${statCard("Train Samples", String(prediction.training_samples || 0))}
+            ${statCard("Test Samples", String(prediction.test_samples || 0))}
+            ${statCard("Test Accuracy", testAcc)}
+            ${statCard("Baseline", baseAcc)}
+            ${statCard("Edge vs Base", edgeVsBaseline, toneClass(prediction.edge_vs_baseline_pct_points))}
+            ${statCard("Brier", brier)}
+            ${statCard("Variant", prediction.variant || "unknown")}
+            ${statCard("Status", prediction.status || "unknown")}
+            ${statCard("History Collected", collected)}
+            ${statCard("Augmented Model", activationEta)}
+          </div>
+          <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
+          <div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>
+          <ul class="history-insights">${notes}</ul>
+        </section>
+      `;
+    }
+
+    function watchCard(watch, history, assessment, checklist, sizingPlan, prediction) {
       const displayName = watch.display_name ? ` (${escapeHtml(watch.display_name)})` : "";
       const spreadValue = watch.order_book?.spread_absolute != null || watch.order_book?.spread_bps != null
         ? `${formatMaybe(watch.order_book?.spread_absolute, 4)} | ${formatBps(watch.order_book?.spread_bps)}`
@@ -2590,10 +3622,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Margin Use", sizingPlan?.margin_usage_pct != null ? `${formatMaybe(sizingPlan.margin_usage_pct, 0)}%` : "unknown")}
             ${statCard("Reserve", sizingPlan?.reserve_pct != null ? `${formatMaybe(sizingPlan.reserve_pct, 0)}%` : "unknown")}
             ${statCard("Actual Lev", sizingPlan?.suggested_actual_leverage > 0 ? `${formatMaybe(sizingPlan.suggested_actual_leverage, 1)}x` : "wait")}
+            ${statCard("Model Bias", prediction?.model_bias || "unknown", badgeClass(prediction?.model_bias || ""))}
+            ${statCard("P Up 1h", prediction?.probability_up != null ? `${formatMaybe(prediction.probability_up * 100, 1)}%` : "unknown", toneClass(prediction?.probability_up != null ? prediction.probability_up - 0.5 : null))}
           </div>
 
           ${entryChecklistPanel(checklist)}
           ${entrySizingPanel(sizingPlan)}
+          ${predictionPanel(prediction)}
 
           <div class="execution-grid">
             ${executionPanel("Buy Slippage vs Best Ask", watch.order_book?.buy_slippage, "buy")}
@@ -2629,7 +3664,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function positionCard(pos, history, assessment) {
+    function positionCard(pos, history, assessment, prediction) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
       const historyInsights = (history?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
@@ -2684,6 +3719,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Macro Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
             ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
             ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
+            ${statCard("Model Bias", prediction?.model_bias || "unknown", badgeClass(prediction?.model_bias || ""))}
+            ${statCard("P Up 1h", prediction?.probability_up != null ? `${formatMaybe(prediction.probability_up * 100, 1)}%` : "unknown", toneClass(prediction?.probability_up != null ? prediction.probability_up - 0.5 : null))}
           </div>
 
           <div class="scenario-grid">
@@ -2692,6 +3729,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${scenarioCard("-1% move", pos.projections?.down_1pct_pnl)}
             ${scenarioCard("-3% move", pos.projections?.down_3pct_pnl)}
           </div>
+
+          ${predictionPanel(prediction)}
 
           <div class="execution-grid">
             ${executionPanel("Buy Slippage vs Best Ask", pos.order_book?.buy_slippage, "buy")}
@@ -2738,6 +3777,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
         : (firstWatch ? snapshot.watch_assessments?.[firstWatch.symbol] : null);
       const firstChecklist = firstWatch ? snapshot.watch_entry_checklists?.[firstWatch.symbol] : null;
       const firstSizingPlan = firstWatch ? snapshot.watch_entry_sizing_plans?.[firstWatch.symbol] : null;
+      const firstPrediction = first
+        ? snapshot.position_predictions?.[first.symbol]
+        : (firstWatch ? snapshot.watch_predictions?.[firstWatch.symbol] : null);
       const staleCount = (snapshot.open_orders || []).filter((order) => order.cleanup_candidate).length;
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
@@ -2755,6 +3797,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
         metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
         metricCard("Margin Use", firstSizingPlan?.margin_usage_pct != null ? `${formatMaybe(firstSizingPlan.margin_usage_pct, 0)}%` : "n/a"),
+        metricCard("Model Bias", firstPrediction?.model_bias || "n/a"),
         metricCard("Stale Cleanup", String(staleCount)),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "flat"),
       ].join("");
@@ -2762,11 +3805,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const cards = document.getElementById("cards");
       if (!snapshot.positions.length) {
         const watchHtml = (snapshot.watch_markets || []).length
-          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol], snapshot.watch_entry_sizing_plans?.[watch.symbol])).join("")
+          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol], snapshot.watch_entry_sizing_plans?.[watch.symbol], snapshot.watch_predictions?.[watch.symbol])).join("")
           : `<div class="empty"><h2>No watch markets yet</h2><div class="empty-copy">Build history on a symbol or leave a related order open to keep a live flat-mode watch here.</div></div>`;
         cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is now showing order visibility and re-entry watch conditions instead of a blank state.</div></div>${watchHtml}`;
       } else {
-        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol])).join("")}`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol], snapshot.position_predictions?.[position.symbol])).join("")}`;
       }
     }
 
@@ -2932,23 +3975,64 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     loaded_context
                 }
             };
-
-            let position_history = match state.history.lock() {
+            let (position_history, prediction_inputs) = match state.history.lock() {
                 Ok(mut history) => {
-                    let summaries = upsert_history(&mut history, &output);
+                    let summaries = upsert_history(&mut history, &output, &market_context);
+                    let prediction_inputs = output
+                        .positions
+                        .iter()
+                        .map(|position| position.symbol.clone())
+                        .chain(output.watch_markets.iter().map(|watch| watch.symbol.clone()))
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .map(|symbol| (symbol.clone(), history.get(&symbol).cloned()))
+                        .collect::<Vec<_>>();
                     if let Err(error) = save_history_file(&state.history_file, &history) {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to persist dashboard history: {error:#}"),
-                    )
+                        )
                         .into_response();
                     }
-                    summaries
+                    (summaries, prediction_inputs)
                 }
                 Err(_) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Dashboard history lock is poisoned".to_string(),
+                    )
+                        .into_response()
+                }
+            };
+            let state_for_predictions = Arc::clone(&state);
+            let predictions = match tokio::task::spawn_blocking(move || -> Result<HashMap<String, ModelPrediction>> {
+                let mut results = HashMap::new();
+                for (symbol, symbol_history) in prediction_inputs {
+                    results.insert(
+                        symbol.clone(),
+                        load_prediction_for_symbol(
+                            &state_for_predictions.prediction_cache,
+                            &symbol,
+                            symbol_history.as_ref(),
+                        )?,
+                    );
+                }
+                Ok(results)
+            })
+            .await
+            {
+                Ok(Ok(items)) => items,
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to load model predictions: {error:#}"),
+                    )
+                        .into_response()
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Prediction worker failed: {error}"),
                     )
                         .into_response()
                 }
@@ -2999,6 +4083,26 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     ))
                 })
                 .collect::<HashMap<_, _>>();
+            let position_predictions = output
+                .positions
+                .iter()
+                .filter_map(|position| {
+                    predictions
+                        .get(&position.symbol)
+                        .cloned()
+                        .map(|prediction| (position.symbol.clone(), prediction))
+                })
+                .collect::<HashMap<_, _>>();
+            let watch_predictions = output
+                .watch_markets
+                .iter()
+                .filter_map(|watch| {
+                    predictions
+                        .get(&watch.symbol)
+                        .cloned()
+                        .map(|prediction| (watch.symbol.clone(), prediction))
+                })
+                .collect::<HashMap<_, _>>();
 
             let payload = DashboardSnapshot {
                 output,
@@ -3008,6 +4112,8 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 watch_assessments,
                 watch_entry_checklists,
                 watch_entry_sizing_plans,
+                position_predictions,
+                watch_predictions,
             };
             (StatusCode::OK, Json(payload)).into_response()
         }
@@ -3043,6 +4149,7 @@ async fn main() -> Result<()> {
         history_file: args.history_file,
         history: Mutex::new(history),
         market_context_cache: Mutex::new(None),
+        prediction_cache: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
