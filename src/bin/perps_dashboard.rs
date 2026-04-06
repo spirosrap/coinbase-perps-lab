@@ -132,6 +132,7 @@ struct DashboardSnapshot {
     market_context: MarketContext,
     setup_assessments: HashMap<String, TradeSetupAssessment>,
     watch_assessments: HashMap<String, TradeSetupAssessment>,
+    watch_entry_checklists: HashMap<String, EntryChecklist>,
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +276,22 @@ struct TradeSetupAssessment {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct EntryChecklist {
+    overall_status: String,
+    passed: usize,
+    total: usize,
+    summary: String,
+    items: Vec<EntryChecklistItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct EntryChecklistItem {
+    label: String,
+    passed: bool,
+    detail: String,
+}
+
 fn history_format_version() -> u32 {
     2
 }
@@ -284,6 +301,15 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn format_pct(value: Option<f64>) -> Option<String> {
+    value.map(|item| format!("{item:.2}%"))
+}
+
+fn format_bps(value: Option<f64>) -> String {
+    value.map(|item| format!("{item:.2} bps"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn build_http_client() -> Result<Client> {
@@ -1315,6 +1341,152 @@ fn assess_watch_setup(
     assessment
 }
 
+fn entry_gate_item(label: &str, passed: bool, detail: String) -> EntryChecklistItem {
+    EntryChecklistItem {
+        label: label.to_string(),
+        passed,
+        detail,
+    }
+}
+
+fn build_watch_entry_checklist(
+    watch: &WatchMarketSummary,
+    history: Option<&PositionHistorySummary>,
+    assessment: &TradeSetupAssessment,
+) -> EntryChecklist {
+    let spread_bps = watch.order_book.as_ref().and_then(|book| book.spread_bps);
+    let buy_10k_bps = watch.order_book.as_ref().and_then(|book| {
+        book.buy_slippage
+            .iter()
+            .find(|estimate| (estimate.quote_notional - 10_000.0).abs() < 0.5)
+            .and_then(|estimate| estimate.slippage_bps)
+    });
+    let top_5_imbalance_pct = watch
+        .order_book
+        .as_ref()
+        .and_then(|book| book.top_5_imbalance_pct);
+    let long_horizon_imbalance_avg = history
+        .and_then(|summary| summary.long_horizon.as_ref())
+        .and_then(|summary| summary.top_5_imbalance_pct.as_ref())
+        .map(|summary| summary.average);
+    let history_mature = history
+        .map(|summary| {
+            summary.samples >= 30
+                && summary
+                    .long_horizon
+                    .as_ref()
+                    .map(|rollup| rollup.buckets >= 6)
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let bias_ok = !matches!(watch.market_bias.as_str(), "mildly bearish" | "bearish");
+    let funding_ok = match (
+        watch.funding_rate_pct,
+        watch.funding_direction.as_deref(),
+    ) {
+        (Some(rate), Some("longs paying shorts")) => rate.abs() < 0.02,
+        _ => true,
+    };
+
+    let items = vec![
+        entry_gate_item(
+            "Macro risk is low",
+            assessment.event_risk == "low",
+            format!(
+                "Current scheduled macro risk is {}.",
+                assessment.event_risk
+            ),
+        ),
+        entry_gate_item(
+            "Spread is tight",
+            spread_bps.map(|value| value <= 5.0).unwrap_or(false),
+            format!(
+                "Current top-of-book spread is {}.",
+                format_bps(spread_bps)
+            ),
+        ),
+        entry_gate_item(
+            "$10k buy slippage is cheap",
+            buy_10k_bps.map(|value| value <= 3.0).unwrap_or(false),
+            format!(
+                "Current $10k aggressive buy slippage is {}.",
+                format_bps(buy_10k_bps)
+            ),
+        ),
+        entry_gate_item(
+            "Near-touch depth is not leaning against longs",
+            top_5_imbalance_pct.map(|value| value > -10.0).unwrap_or(false),
+            format!(
+                "Current top-5 imbalance is {}.",
+                format_pct(top_5_imbalance_pct)
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        ),
+        entry_gate_item(
+            "Long-horizon depth is not leaning against longs",
+            long_horizon_imbalance_avg
+                .map(|value| value > -10.0)
+                .unwrap_or(false),
+            format!(
+                "Long-horizon average imbalance is {}.",
+                format_pct(long_horizon_imbalance_avg)
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        ),
+        entry_gate_item(
+            "Bias is not bearish",
+            bias_ok,
+            format!("Current heuristic market bias is {}.", watch.market_bias),
+        ),
+        entry_gate_item(
+            "Funding is not materially charging longs",
+            funding_ok,
+            format!(
+                "Funding is {} ({}).",
+                format_pct(watch.funding_rate_pct)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                watch.funding_direction
+                    .clone()
+                    .unwrap_or_else(|| "unknown direction".to_string())
+            ),
+        ),
+        entry_gate_item(
+            "History is mature enough",
+            history_mature,
+            match history {
+                Some(summary) => format!(
+                    "History has {} raw samples and {} long-horizon buckets.",
+                    summary.samples,
+                    summary
+                        .long_horizon
+                        .as_ref()
+                        .map(|rollup| rollup.buckets)
+                        .unwrap_or(0)
+                ),
+                None => "No persisted history is available yet.".to_string(),
+            },
+        ),
+    ];
+
+    let passed = items.iter().filter(|item| item.passed).count();
+    let total = items.len();
+    let overall_status = if passed == total { "ready" } else { "wait" }.to_string();
+    let summary = if passed == total {
+        "All conservative long-entry gates are passing."
+    } else {
+        "One or more conservative long-entry gates are failing. Wait for better alignment."
+    }
+    .to_string();
+
+    EntryChecklist {
+        overall_status,
+        passed,
+        total,
+        summary,
+        items,
+    }
+}
+
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -1958,7 +2130,46 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function watchCard(watch, history, assessment) {
+    function entryChecklistPanel(checklist) {
+      if (!checklist) {
+        return `
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Entry Gate</h2>
+                <div class="subtext">No checklist is available yet.</div>
+              </div>
+            </div>
+          </section>
+        `;
+      }
+
+      const items = (checklist.items || []).map((item) => `
+        <section class="history-panel">
+          <div class="section-title">${escapeHtml(item.label)}</div>
+          <div class="history-value ${item.passed ? "positive" : "negative"}">${item.passed ? "Pass" : "Wait"}</div>
+          <div class="history-meta">${escapeHtml(item.detail)}</div>
+        </section>
+      `).join("");
+
+      return `
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Entry Gate</h2>
+              <div class="subtext">${escapeHtml(checklist.summary || "")}</div>
+            </div>
+            <div class="badges">
+              <span class="badge ${badgeClass(checklist.overall_status)}">${escapeHtml(checklist.overall_status)}</span>
+              <span class="badge neutral">${escapeHtml(`${checklist.passed}/${checklist.total} passed`)}</span>
+            </div>
+          </div>
+          <div class="history-grid">${items}</div>
+        </section>
+      `;
+    }
+
+    function watchCard(watch, history, assessment, checklist) {
       const displayName = watch.display_name ? ` (${escapeHtml(watch.display_name)})` : "";
       const spreadValue = watch.order_book?.spread_absolute != null || watch.order_book?.spread_bps != null
         ? `${formatMaybe(watch.order_book?.spread_absolute, 4)} | ${formatBps(watch.order_book?.spread_bps)}`
@@ -1996,6 +2207,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
             ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
           </div>
+
+          ${entryChecklistPanel(checklist)}
 
           <div class="execution-grid">
             ${executionPanel("Buy Slippage vs Best Ask", watch.order_book?.buy_slippage, "buy")}
@@ -2138,6 +2351,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const firstSetup = first
         ? snapshot.setup_assessments?.[first.symbol]
         : (firstWatch ? snapshot.watch_assessments?.[firstWatch.symbol] : null);
+      const firstChecklist = firstWatch ? snapshot.watch_entry_checklists?.[firstWatch.symbol] : null;
       const staleCount = (snapshot.open_orders || []).filter((order) => order.cleanup_candidate).length;
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
@@ -2151,6 +2365,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         ),
         metricCard("Credential Source", snapshot.credential_source || "unknown", "compact"),
         metricCard("Setup Status", firstSetup?.alignment_status || "no position"),
+        metricCard("Entry Gate", firstChecklist?.overall_status || "n/a"),
         metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
         metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
         metricCard("Stale Cleanup", String(staleCount)),
@@ -2160,7 +2375,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const cards = document.getElementById("cards");
       if (!snapshot.positions.length) {
         const watchHtml = (snapshot.watch_markets || []).length
-          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol])).join("")
+          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol])).join("")
           : `<div class="empty"><h2>No watch markets yet</h2><div class="empty-copy">Build history on a symbol or leave a related order open to keep a live flat-mode watch here.</div></div>`;
         cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is now showing order visibility and re-entry watch conditions instead of a blank state.</div></div>${watchHtml}`;
       } else {
@@ -2312,6 +2527,18 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     )
                 })
                 .collect::<HashMap<_, _>>();
+            let watch_entry_checklists = output
+                .watch_markets
+                .iter()
+                .filter_map(|watch| {
+                    let history = position_history.get(&watch.symbol);
+                    let assessment = watch_assessments.get(&watch.symbol)?;
+                    Some((
+                        watch.symbol.clone(),
+                        build_watch_entry_checklist(watch, history, assessment),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
 
             let payload = DashboardSnapshot {
                 output,
@@ -2319,6 +2546,7 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 market_context,
                 setup_assessments,
                 watch_assessments,
+                watch_entry_checklists,
             };
             (StatusCode::OK, Json(payload)).into_response()
         }

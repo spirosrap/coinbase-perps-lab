@@ -141,6 +141,7 @@ The dashboard also adds a conservative setup layer:
 - live open-order visibility for current futures/perpetual orders
 - stale reduce-only cleanup review when no matching position is open
 - flat-mode re-entry watch cards for recently tracked symbols
+- a strict pass/fail long-entry gate for flat-mode watch cards
 
 Earnings and geopolitical headlines are not yet scored in the risk model. This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
@@ -151,6 +152,7 @@ Earnings and geopolitical headlines are not yet scored in the risk model. This s
 - `basis` is the percentage difference between perp mark and index price
 - `funding` is shown per funding interval, with a direction label to indicate which side is paying
 - `funding intensity` classifies the size of the funding rate: `near zero`, `tiny`, `noticeable`, `elevated`, `large`, or `very large`
+- `Entry Gate` is a conservative long re-entry checklist for flat-mode watch cards. It only flips to `ready` when all of its gates are passing.
 - `open interest` is the total number of open contracts in the market
 - `open interest notional` converts that contract count to quote notional at the current mark
 - `position share of open interest` shows how large your position is relative to the whole market
