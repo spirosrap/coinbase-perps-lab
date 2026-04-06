@@ -15,6 +15,7 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,10 +27,14 @@ const ROLLUP_BUCKET_MS: u64 = 5 * 60 * 1000;
 const MAX_ROLLUP_BUCKETS: usize = 14 * 24 * 12;
 const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
+const MARKET_CONTEXT_TTL_MS: u64 = 30 * 60 * 1000;
 const FED_MONETARY_FEED_URL: &str = "https://www.federalreserve.gov/feeds/press_monetary.xml";
 const FED_FOMC_CALENDAR_URL: &str = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm";
 const OMB_PFEI_PDF_URL_PATTERN: &str =
     "https://www.whitehouse.gov/wp-content/uploads/{upload_year}/09/pfei_schedule_release_dates_cy{year}.pdf";
+const GOOGLE_NEWS_GEOPOLITICS_RSS_URL: &str = "https://news.google.com/rss/search?q=%28Iran%20OR%20Israel%20OR%20Ukraine%20OR%20Russia%20OR%20China%20OR%20Taiwan%20OR%20oil%20OR%20tariffs%20OR%20sanctions%20OR%20shipping%29%20when%3A7d&hl=en-US&gl=US&ceid=US:en";
+const US_EQUITY_EARNINGS_PROXY_TICKERS: [&str; 7] =
+    ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"];
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -57,6 +62,19 @@ struct AppState {
     refresh_ms: u64,
     history_file: PathBuf,
     history: Mutex<HashMap<String, PersistedSymbolHistory>>,
+    market_context_cache: Mutex<Option<CachedMarketContext>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarketContextScope {
+    include_equity_earnings_proxy: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMarketContext {
+    loaded_at_ms: u64,
+    scope: MarketContextScope,
+    context: MarketContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,15 +198,17 @@ struct MetricPoint {
     value: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MarketContext {
     headlines: Vec<OfficialHeadline>,
     upcoming_events: Vec<UpcomingEvent>,
+    scheduled_risk: String,
+    headline_risk: String,
     event_risk: String,
     notes: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OfficialHeadline {
     source: String,
     title: String,
@@ -372,37 +392,66 @@ fn decode_html_entities(input: &str) -> String {
         .replace("&#8211;", "–")
 }
 
-fn parse_fed_headlines(client: &Client) -> Result<Vec<OfficialHeadline>> {
-    let xml = get_text(client, FED_MONETARY_FEED_URL)?;
+fn parse_rss_items(xml: &str, default_source: &str, split_title_source: bool) -> Vec<OfficialHeadline> {
     let item_re = Regex::new(r"(?s)<item>(.*?)</item>").unwrap();
     let title_re = Regex::new(r"(?s)<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>").unwrap();
     let link_re = Regex::new(r"(?s)<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</link>").unwrap();
     let pub_date_re = Regex::new(r"(?s)<pubDate>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</pubDate>").unwrap();
 
-    let mut headlines = Vec::new();
-    for caps in item_re.captures_iter(&xml).take(4) {
-        let item = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let title = title_re
-            .captures(item)
-            .and_then(|caps| caps.get(1).map(|m| decode_html_entities(m.as_str())));
-        let link = link_re
-            .captures(item)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
-        let published_at = pub_date_re
-            .captures(item)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
+    item_re
+        .captures_iter(xml)
+        .filter_map(|caps| {
+            let item = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let raw_title = title_re
+                .captures(item)
+                .and_then(|caps| caps.get(1).map(|m| decode_html_entities(m.as_str())))?;
+            let link = link_re
+                .captures(item)
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))?;
+            let published_at = pub_date_re
+                .captures(item)
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()));
 
-        if let (Some(title), Some(link)) = (title, link) {
-            headlines.push(OfficialHeadline {
-                source: "Federal Reserve".to_string(),
+            let (title, source) = if split_title_source {
+                split_news_title_source(&raw_title, default_source)
+            } else {
+                (raw_title, default_source.to_string())
+            };
+
+            Some(OfficialHeadline {
+                source,
                 title,
                 published_at,
                 link,
-            });
+            })
+        })
+        .collect()
+}
+
+fn split_news_title_source(raw_title: &str, default_source: &str) -> (String, String) {
+    if let Some((title, source)) = raw_title.rsplit_once(" - ") {
+        let cleaned_source = source.trim();
+        if !cleaned_source.is_empty() && cleaned_source.len() <= 48 {
+            return (title.trim().to_string(), cleaned_source.to_string());
         }
     }
+    (raw_title.trim().to_string(), default_source.to_string())
+}
 
-    Ok(headlines)
+fn parse_fed_headlines(client: &Client) -> Result<Vec<OfficialHeadline>> {
+    let xml = get_text(client, FED_MONETARY_FEED_URL)?;
+    Ok(parse_rss_items(&xml, "Federal Reserve", false)
+        .into_iter()
+        .take(4)
+        .collect())
+}
+
+fn parse_geopolitical_headlines(client: &Client) -> Result<Vec<OfficialHeadline>> {
+    let xml = get_text(client, GOOGLE_NEWS_GEOPOLITICS_RSS_URL)?;
+    Ok(parse_rss_items(&xml, "Google News", true)
+        .into_iter()
+        .take(4)
+        .collect())
 }
 
 fn month_name_to_number(name: &str) -> Option<u32> {
@@ -579,25 +628,205 @@ fn parse_fomc_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
     Ok(events.into_iter().take(3).collect())
 }
 
-fn derive_event_risk(upcoming_events: &[UpcomingEvent]) -> String {
-    if upcoming_events.iter().any(|event| event.risk == "high") {
+fn parse_csv_row(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+fn parse_equity_earnings_proxy_events(client: &Client) -> Result<Vec<UpcomingEvent>> {
+    let api_key = env::var("ALPHA_VANTAGE_API_KEY")
+        .context("ALPHA_VANTAGE_API_KEY is not set for earnings proxy coverage")?;
+    let url = format!(
+        "https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&horizon=3month&apikey={api_key}"
+    );
+    let csv = get_text(client, &url)?;
+    let today = Utc::now().date_naive();
+    let watchlist = US_EQUITY_EARNINGS_PROXY_TICKERS
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut selected = HashMap::<String, UpcomingEvent>::new();
+
+    for line in csv.lines().skip(1) {
+        let fields = parse_csv_row(line);
+        if fields.len() < 3 {
+            continue;
+        }
+        if fields[0] == "Information" || fields[0] == "Note" || fields[0].is_empty() {
+            anyhow::bail!("unexpected Alpha Vantage earnings calendar response");
+        }
+        let symbol = fields[0].trim();
+        if !watchlist.contains(symbol) {
+            continue;
+        }
+        if selected.contains_key(symbol) {
+            continue;
+        }
+        let Ok(report_date) = NaiveDate::parse_from_str(fields[2].trim(), "%Y-%m-%d") else {
+            continue;
+        };
+        if report_date < today {
+            continue;
+        }
+        let days_until = (report_date - today).num_days() as f64;
+        let company_name = fields
+            .get(1)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(symbol);
+        selected.insert(
+            symbol.to_string(),
+            UpcomingEvent {
+                source: "Alpha Vantage earnings proxy".to_string(),
+                category: "earnings".to_string(),
+                title: format!("{symbol} earnings ({company_name})"),
+                scheduled_for: report_date.to_string(),
+                days_until: Some(days_until),
+                risk: classify_event_risk(days_until, 1.0, 7.0),
+            },
+        );
+    }
+
+    let mut events = selected.into_values().collect::<Vec<_>>();
+    events.sort_by(|left, right| left.scheduled_for.cmp(&right.scheduled_for));
+    events.truncate(6);
+    Ok(events)
+}
+
+fn derive_risk_level(values: &[String]) -> String {
+    if values.iter().any(|value| value == "high") {
         "high".to_string()
-    } else if upcoming_events.iter().any(|event| event.risk == "medium") {
+    } else if values.iter().any(|value| value == "medium") {
         "medium".to_string()
     } else {
         "low".to_string()
     }
 }
 
-fn load_market_context(client: &Client) -> MarketContext {
+fn derive_event_risk(upcoming_events: &[UpcomingEvent]) -> String {
+    derive_risk_level(
+        &upcoming_events
+            .iter()
+            .map(|event| event.risk.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn geopolitical_keyword_score(title: &str) -> usize {
+    let lower = title.to_ascii_lowercase();
+    let mut score = 0usize;
+    for keyword in [
+        "war",
+        "missile",
+        "strike",
+        "attack",
+        "invasion",
+        "nuclear",
+        "bomb",
+        "blockade",
+        "retaliat",
+    ] {
+        if lower.contains(keyword) {
+            score += 2;
+        }
+    }
+    for keyword in [
+        "iran",
+        "israel",
+        "ukraine",
+        "russia",
+        "china",
+        "taiwan",
+        "sanction",
+        "tariff",
+        "oil",
+        "shipping",
+        "troop",
+        "military",
+        "conflict",
+    ] {
+        if lower.contains(keyword) {
+            score += 1;
+        }
+    }
+    score
+}
+
+fn derive_headline_risk(headlines: &[OfficialHeadline]) -> String {
+    let mut high_hits = 0usize;
+    let mut medium_hits = 0usize;
+    for headline in headlines.iter().take(4) {
+        let score = geopolitical_keyword_score(&headline.title);
+        if score >= 4 {
+            high_hits += 1;
+        } else if score >= 2 {
+            medium_hits += 1;
+        }
+    }
+    if high_hits >= 2 {
+        "high".to_string()
+    } else if high_hits >= 1 || medium_hits >= 2 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn build_market_context_scope(output: &Output) -> MarketContextScope {
+    let include_equity_earnings_proxy = output
+        .positions
+        .iter()
+        .filter_map(|position| position.underlying_type.as_deref())
+        .chain(
+            output
+                .watch_markets
+                .iter()
+                .filter_map(|watch| watch.underlying_type.as_deref()),
+        )
+        .any(|underlying| underlying == "EQUITY_ETF" || underlying == "EQUITY");
+
+    MarketContextScope {
+        include_equity_earnings_proxy,
+    }
+}
+
+fn load_market_context(client: &Client, scope: &MarketContextScope) -> MarketContext {
     let mut notes = Vec::new();
-    let headlines = match parse_fed_headlines(client) {
+    let mut headlines = match parse_fed_headlines(client) {
         Ok(items) => items,
         Err(error) => {
             notes.push(format!("Fed headline fetch failed: {error:#}"));
             Vec::new()
         }
     };
+    match parse_geopolitical_headlines(client) {
+        Ok(mut items) => headlines.append(&mut items),
+        Err(error) => {
+            notes.push(format!("Geopolitical headline fetch failed: {error:#}"));
+        }
+    }
     let mut upcoming_events = match parse_fomc_events(client) {
         Ok(items) => items,
         Err(error) => {
@@ -613,8 +842,19 @@ fn load_market_context(client: &Client) -> MarketContext {
             ));
         }
     }
+    if scope.include_equity_earnings_proxy {
+        match parse_equity_earnings_proxy_events(client) {
+            Ok(mut items) => upcoming_events.append(&mut items),
+            Err(error) => {
+                notes.push(format!("Earnings proxy fetch failed: {error:#}"));
+            }
+        }
+    }
     upcoming_events.sort_by(|left, right| left.scheduled_for.cmp(&right.scheduled_for));
-    upcoming_events.truncate(8);
+    upcoming_events.truncate(12);
+    let scheduled_risk = derive_event_risk(&upcoming_events);
+    let headline_risk = derive_headline_risk(&headlines);
+    let event_risk = derive_risk_level(&[scheduled_risk.clone(), headline_risk.clone()]);
     if notes.is_empty() {
         notes.push(
             "Scheduled macro risk is currently derived from the official FOMC calendar and the White House / OIRA principal economic indicators schedule."
@@ -625,13 +865,21 @@ fn load_market_context(client: &Client) -> MarketContext {
                 .to_string(),
         );
         notes.push(
-            "Earnings and geopolitical headlines are not yet scored in the risk model."
+            "Geopolitical headline risk is derived from a Google News RSS search over a fixed market-relevant keyword set. This is heuristic and not exhaustive."
                 .to_string(),
         );
+        if scope.include_equity_earnings_proxy {
+            notes.push(
+                "US equity earnings coverage is proxied from Alpha Vantage's earnings calendar for a fixed large-cap watchlist (AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA). This is a market-impact proxy, not a full SPY holdings calendar."
+                    .to_string(),
+            );
+        }
     }
 
     MarketContext {
-        event_risk: derive_event_risk(&upcoming_events),
+        scheduled_risk,
+        headline_risk,
+        event_risk,
         headlines,
         upcoming_events,
         notes,
@@ -1159,7 +1407,7 @@ fn assess_directional_setup(
             suggested_max_leverage = suggested_max_leverage.min(2.0);
             penalties += 2;
             notes.push(
-                "A scheduled macro or policy event is close enough that event risk should dominate leverage decisions."
+                "Current market-context risk is high enough that event or headline risk should dominate leverage decisions."
                     .to_string(),
             );
         }
@@ -1167,7 +1415,7 @@ fn assess_directional_setup(
             suggested_max_leverage = suggested_max_leverage.min(3.0);
             penalties += 1;
             notes.push(
-                "A scheduled macro or policy event is within roughly a week, so leverage should stay moderate."
+                "Current market-context risk is elevated, so leverage should stay moderate."
                     .to_string(),
             );
         }
@@ -1405,7 +1653,7 @@ fn build_watch_entry_checklist(
             "Macro risk is low",
             assessment.event_risk == "low",
             format!(
-                "Current scheduled macro risk is {}.",
+                "Current combined market-context risk is {}.",
                 assessment.event_risk
             ),
         ),
@@ -2142,7 +2390,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     function marketContextPanels(context) {
       const headlines = (context?.headlines || [])
-        .map((item) => `<li><a href="${escapeHtml(item.link)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>${item.published_at ? ` <span class="history-meta">${escapeHtml(item.published_at)}</span>` : ""}</li>`)
+        .map((item) => `<li><a href="${escapeHtml(item.link)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a><br><span class="history-meta">${escapeHtml(item.source)}${item.published_at ? ` · ${escapeHtml(item.published_at)}` : ""}</span></li>`)
         .join("");
       const events = (context?.upcoming_events || [])
         .map((item) => `<li><strong>${escapeHtml(item.title)}</strong><br><span class="history-meta">${escapeHtml(item.scheduled_for)}${item.days_until != null ? ` (${formatMaybe(item.days_until, 1)} days)` : ""} · ${escapeHtml(item.risk)} risk · ${escapeHtml(item.category)} · ${escapeHtml(item.source)}</span></li>`)
@@ -2154,17 +2402,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `
         <div class="context-grid">
           <section class="context-panel">
-            <div class="section-title">Scheduled Macro Context</div>
-            <div class="history-value">${escapeHtml(context?.event_risk || "unknown")} scheduled risk</div>
+            <div class="section-title">Combined Market Context</div>
+            <div class="history-value">${escapeHtml(context?.event_risk || "unknown")} combined risk</div>
+            <div class="history-meta">scheduled: ${escapeHtml(context?.scheduled_risk || "unknown")} · headlines: ${escapeHtml(context?.headline_risk || "unknown")}</div>
             <ul class="context-list">${notes}</ul>
           </section>
           <section class="context-panel">
-            <div class="section-title">Policy Headlines</div>
-            <ul class="headline-list">${headlines || "<li>No official headlines loaded.</li>"}</ul>
+            <div class="section-title">Policy + Geopolitics Headlines</div>
+            <ul class="headline-list">${headlines || "<li>No headline context loaded.</li>"}</ul>
           </section>
           <section class="context-panel">
-            <div class="section-title">Upcoming Scheduled Events</div>
-            <ul class="context-list">${events || "<li>No upcoming official events loaded.</li>"}</ul>
+            <div class="section-title">Upcoming Scheduled Events + Earnings</div>
+            <ul class="context-list">${events || "<li>No upcoming scheduled events loaded.</li>"}</ul>
           </section>
         </div>
       `;
@@ -2614,15 +2863,76 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
     };
 
-    match tokio::task::spawn_blocking(move || -> Result<(Output, MarketContext)> {
-        let output = load_output_with_watch(portfolio.as_deref(), &watch_symbols)?;
-        let client = build_http_client()?;
-        let market_context = load_market_context(&client);
-        Ok((output, market_context))
-    })
-    .await
+    match tokio::task::spawn_blocking(move || load_output_with_watch(portfolio.as_deref(), &watch_symbols))
+        .await
     {
-        Ok(Ok((output, market_context))) => {
+        Ok(Ok(output)) => {
+            let scope = build_market_context_scope(&output);
+            let market_context = {
+                let cached = match state.market_context_cache.lock() {
+                    Ok(cache) => cache.clone(),
+                    Err(_) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Market context cache lock is poisoned".to_string(),
+                        )
+                            .into_response()
+                    }
+                };
+
+                let maybe_cached = cached.filter(|entry| {
+                    entry.scope == scope
+                        && now_millis().saturating_sub(entry.loaded_at_ms) <= MARKET_CONTEXT_TTL_MS
+                });
+
+                if let Some(entry) = maybe_cached {
+                    entry.context
+                } else {
+                    let scope_for_load = scope.clone();
+                    let loaded_context = match tokio::task::spawn_blocking(move || -> Result<MarketContext> {
+                        let client = build_http_client()?;
+                        Ok(load_market_context(&client, &scope_for_load))
+                    })
+                    .await
+                    {
+                        Ok(Ok(context)) => context,
+                        Ok(Err(error)) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Failed to load market context: {error:#}"),
+                            )
+                                .into_response()
+                        }
+                        Err(error) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Market context worker failed: {error}"),
+                            )
+                                .into_response()
+                        }
+                    };
+
+                    match state.market_context_cache.lock() {
+                        Ok(mut cache) => {
+                            *cache = Some(CachedMarketContext {
+                                loaded_at_ms: now_millis(),
+                                scope,
+                                context: loaded_context.clone(),
+                            });
+                        }
+                        Err(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Market context cache lock is poisoned".to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+
+                    loaded_context
+                }
+            };
+
             let position_history = match state.history.lock() {
                 Ok(mut history) => {
                     let summaries = upsert_history(&mut history, &output);
@@ -2732,6 +3042,7 @@ async fn main() -> Result<()> {
         refresh_ms: args.refresh_seconds.saturating_mul(1000),
         history_file: args.history_file,
         history: Mutex::new(history),
+        market_context_cache: Mutex::new(None),
     });
 
     let app = Router::new()

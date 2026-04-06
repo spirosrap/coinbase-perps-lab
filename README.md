@@ -57,10 +57,11 @@ It prefers `API_KEY_PERPS` and `API_SECRET_PERPS` first.
 
 Optional extras:
 
+- `ALPHA_VANTAGE_API_KEY`
 - `OPENAI_API_KEY`
 - `GEMINI_API_KEY`
 
-Those optional keys are not required for position discovery, but the template leaves room for future experiments in the same workspace.
+`ALPHA_VANTAGE_API_KEY` is optional for core position discovery, but it is used by the dashboard's equity-earnings proxy layer. The other optional keys are only kept for future experiments in the same workspace.
 
 ## Usage
 
@@ -136,7 +137,9 @@ The dashboard also adds a conservative setup layer:
 - official Fed monetary-policy headlines from the Federal Reserve RSS feed
 - scheduled macro events from the official FOMC calendar and the White House / OIRA principal economic indicators schedule
 - current coverage includes FOMC, CPI, jobs, PCE, GDP, retail sales, and PPI
-- a heuristic scheduled-macro risk level
+- Google News RSS headline coverage for a fixed geopolitics query, folded into a heuristic headline-risk overlay
+- Alpha Vantage earnings-calendar coverage for a fixed large-cap proxy watchlist (`AAPL`, `MSFT`, `NVDA`, `AMZN`, `META`, `GOOGL`, `TSLA`) when the watched market is a US equity ETF/perp
+- a combined risk level derived from scheduled events plus the headline-risk overlay
 - a heuristic setup status and suggested max leverage per position
 - live open-order visibility for current futures/perpetual orders
 - stale reduce-only cleanup review when no matching position is open
@@ -144,7 +147,7 @@ The dashboard also adds a conservative setup layer:
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
 
-Earnings and geopolitical headlines are not yet scored in the risk model. This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
+This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
 ## Interpreting the Rust output
 
@@ -159,6 +162,10 @@ Earnings and geopolitical headlines are not yet scored in the risk model. This s
 - `aligned` but not `ready` uses `40%`, keeps `60%` in reserve, and allows up to `75%` of the leverage cap
 - `mixed` uses `25%`, keeps `75%` in reserve, and allows up to `50%` of the leverage cap
 - `avoid aggression` uses `0%` and waits
+- `Macro Risk` is now a combined context label:
+- `scheduled risk` comes from FOMC plus the official White House / OIRA macro calendar, and may also include the earnings proxy schedule for US equity ETF/perp watches
+- `headline risk` comes from a keyword-based geopolitical news scan and is heuristic by construction
+- the dashboard uses the higher of those two layers as the combined risk label
 - `open interest` is the total number of open contracts in the market
 - `open interest notional` converts that contract count to quote notional at the current mark
 - `position share of open interest` shows how large your position is relative to the whole market
@@ -236,7 +243,7 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 7. In dashboard mode, keeps a bounded rolling history of spread, top-5 imbalance, and selected slippage metrics
 8. Persists that dashboard history to a local JSON file so it survives restarts
 9. Maintains longer-horizon `5` minute rollups so the dashboard can compare current microstructure against a broader recent baseline
-10. In dashboard mode, loads official Fed policy headlines plus scheduled macro events from the FOMC calendar and White House / OIRA release schedule, then derives a conservative setup/leverage assessment
+10. In dashboard mode, loads cached market context from Fed policy feeds, the White House / OIRA release schedule, a Google News geopolitics headline scan, and an Alpha Vantage equity-earnings proxy when relevant, then derives a conservative combined-risk and setup/leverage assessment
 11. Pulls recent futures/perpetual orders and filters for active orders so the dashboard can show open orders and stale reduce-only cleanup candidates
 12. When no position is open, keeps live watch-market snapshots for recently tracked symbols so the dashboard remains useful in flat mode
 
