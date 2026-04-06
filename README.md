@@ -142,6 +142,7 @@ The dashboard also adds a conservative setup layer:
 - stale reduce-only cleanup review when no matching position is open
 - flat-mode re-entry watch cards for recently tracked symbols
 - a strict pass/fail long-entry gate for flat-mode watch cards
+- a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
 
 Earnings and geopolitical headlines are not yet scored in the risk model. This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
@@ -153,6 +154,11 @@ Earnings and geopolitical headlines are not yet scored in the risk model. This s
 - `funding` is shown per funding interval, with a direction label to indicate which side is paying
 - `funding intensity` classifies the size of the funding rate: `near zero`, `tiny`, `noticeable`, `elevated`, `large`, or `very large`
 - `Entry Gate` is a conservative long re-entry checklist for flat-mode watch cards. It only flips to `ready` when all of its gates are passing.
+- `Entry Sizing` converts the current watch state into a conservative allocation plan based on available INTX margin:
+- `ready` uses `60%` of available margin, keeps `40%` in reserve, and allows up to `100%` of the current suggested max leverage
+- `aligned` but not `ready` uses `40%`, keeps `60%` in reserve, and allows up to `75%` of the leverage cap
+- `mixed` uses `25%`, keeps `75%` in reserve, and allows up to `50%` of the leverage cap
+- `avoid aggression` uses `0%` and waits
 - `open interest` is the total number of open contracts in the market
 - `open interest notional` converts that contract count to quote notional at the current mark
 - `position share of open interest` shows how large your position is relative to the whole market

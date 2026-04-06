@@ -133,6 +133,7 @@ struct DashboardSnapshot {
     setup_assessments: HashMap<String, TradeSetupAssessment>,
     watch_assessments: HashMap<String, TradeSetupAssessment>,
     watch_entry_checklists: HashMap<String, EntryChecklist>,
+    watch_entry_sizing_plans: HashMap<String, EntrySizingPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +291,17 @@ struct EntryChecklistItem {
     label: String,
     passed: bool,
     detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EntrySizingPlan {
+    status: String,
+    margin_usage_pct: f64,
+    reserve_pct: f64,
+    leverage_fraction_pct: f64,
+    suggested_actual_leverage: f64,
+    summary: String,
+    notes: Vec<String>,
 }
 
 fn history_format_version() -> u32 {
@@ -1487,6 +1499,88 @@ fn build_watch_entry_checklist(
     }
 }
 
+fn build_watch_entry_sizing_plan(
+    assessment: &TradeSetupAssessment,
+    checklist: &EntryChecklist,
+) -> EntrySizingPlan {
+    let (status, margin_usage_pct, reserve_pct, leverage_fraction_pct, summary, notes) =
+        if checklist.overall_status == "ready" {
+            (
+                "ready".to_string(),
+                60.0,
+                40.0,
+                100.0,
+                "Use 60% of available INTX margin for position collateral and keep 40% in reserve."
+                    .to_string(),
+                vec![
+                    "This plan is only active when the long entry gate is fully passing."
+                        .to_string(),
+                    "Suggested actual leverage can use the full current dashboard leverage cap."
+                        .to_string(),
+                ],
+            )
+        } else {
+            match assessment.alignment_status.as_str() {
+                "aligned" => (
+                    "starter".to_string(),
+                    40.0,
+                    60.0,
+                    75.0,
+                    "Conditions are improving, but the gate is not fully ready. Size as a starter only."
+                        .to_string(),
+                    vec![
+                        "Use less than half of available INTX margin until the remaining gate failures clear."
+                            .to_string(),
+                        "Keep a large reserve buffer and stay below the full leverage cap."
+                            .to_string(),
+                    ],
+                ),
+                "mixed" => (
+                    "probe".to_string(),
+                    25.0,
+                    75.0,
+                    50.0,
+                    "Setup is mixed. If you insist on entering early, keep it to a small probe."
+                        .to_string(),
+                    vec![
+                        "Most available margin should remain unused while the setup is still mixed."
+                            .to_string(),
+                        "Use about half of the current dashboard leverage cap at most."
+                            .to_string(),
+                    ],
+                ),
+                _ => (
+                    "stand aside".to_string(),
+                    0.0,
+                    100.0,
+                    0.0,
+                    "Do not allocate new margin while the dashboard is still in avoid-aggression mode."
+                        .to_string(),
+                    vec![
+                        "Wait for the entry gate to improve before deploying new collateral."
+                            .to_string(),
+                    ],
+                ),
+            }
+        };
+
+    let suggested_actual_leverage = if leverage_fraction_pct <= 0.0 {
+        0.0
+    } else {
+        assessment.suggested_max_leverage * (leverage_fraction_pct / 100.0)
+    };
+
+    EntrySizingPlan {
+        status,
+        margin_usage_pct,
+        reserve_pct,
+        leverage_fraction_pct,
+        suggested_actual_leverage,
+        summary,
+        notes,
+    }
+}
+
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -2169,7 +2263,45 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
-    function watchCard(watch, history, assessment, checklist) {
+    function entrySizingPanel(plan) {
+      if (!plan) {
+        return `
+          <section class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Entry Sizing</h2>
+                <div class="subtext">No sizing plan is available yet.</div>
+              </div>
+            </div>
+          </section>
+        `;
+      }
+
+      const notes = (plan.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+      return `
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Entry Sizing</h2>
+              <div class="subtext">${escapeHtml(plan.summary || "")}</div>
+            </div>
+            <div class="badges">
+              <span class="badge ${badgeClass(plan.status)}">${escapeHtml(plan.status)}</span>
+            </div>
+          </div>
+          <div class="stats-grid">
+            ${statCard("Margin Use", `${formatMaybe(plan.margin_usage_pct, 0)}%`)}
+            ${statCard("Reserve", `${formatMaybe(plan.reserve_pct, 0)}%`)}
+            ${statCard("Lev Use of Cap", `${formatMaybe(plan.leverage_fraction_pct, 0)}%`)}
+            ${statCard("Suggested Actual Lev", plan.suggested_actual_leverage > 0 ? `${formatMaybe(plan.suggested_actual_leverage, 1)}x` : "wait")}
+          </div>
+          <div class="signal-note">Percentages refer to currently available INTX margin, not total account equity.</div>
+          <ul class="history-insights">${notes}</ul>
+        </section>
+      `;
+    }
+
+    function watchCard(watch, history, assessment, checklist, sizingPlan) {
       const displayName = watch.display_name ? ` (${escapeHtml(watch.display_name)})` : "";
       const spreadValue = watch.order_book?.spread_absolute != null || watch.order_book?.spread_bps != null
         ? `${formatMaybe(watch.order_book?.spread_absolute, 4)} | ${formatBps(watch.order_book?.spread_bps)}`
@@ -2206,9 +2338,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Macro Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
             ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
             ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
+            ${statCard("Margin Use", sizingPlan?.margin_usage_pct != null ? `${formatMaybe(sizingPlan.margin_usage_pct, 0)}%` : "unknown")}
+            ${statCard("Reserve", sizingPlan?.reserve_pct != null ? `${formatMaybe(sizingPlan.reserve_pct, 0)}%` : "unknown")}
+            ${statCard("Actual Lev", sizingPlan?.suggested_actual_leverage > 0 ? `${formatMaybe(sizingPlan.suggested_actual_leverage, 1)}x` : "wait")}
           </div>
 
           ${entryChecklistPanel(checklist)}
+          ${entrySizingPanel(sizingPlan)}
 
           <div class="execution-grid">
             ${executionPanel("Buy Slippage vs Best Ask", watch.order_book?.buy_slippage, "buy")}
@@ -2352,6 +2488,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         ? snapshot.setup_assessments?.[first.symbol]
         : (firstWatch ? snapshot.watch_assessments?.[firstWatch.symbol] : null);
       const firstChecklist = firstWatch ? snapshot.watch_entry_checklists?.[firstWatch.symbol] : null;
+      const firstSizingPlan = firstWatch ? snapshot.watch_entry_sizing_plans?.[firstWatch.symbol] : null;
       const staleCount = (snapshot.open_orders || []).filter((order) => order.cleanup_candidate).length;
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
@@ -2368,6 +2505,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         metricCard("Entry Gate", firstChecklist?.overall_status || "n/a"),
         metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
         metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
+        metricCard("Margin Use", firstSizingPlan?.margin_usage_pct != null ? `${formatMaybe(firstSizingPlan.margin_usage_pct, 0)}%` : "n/a"),
         metricCard("Stale Cleanup", String(staleCount)),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "flat"),
       ].join("");
@@ -2375,7 +2513,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const cards = document.getElementById("cards");
       if (!snapshot.positions.length) {
         const watchHtml = (snapshot.watch_markets || []).length
-          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol])).join("")
+          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol], snapshot.watch_entry_sizing_plans?.[watch.symbol])).join("")
           : `<div class="empty"><h2>No watch markets yet</h2><div class="empty-copy">Build history on a symbol or leave a related order open to keep a live flat-mode watch here.</div></div>`;
         cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is now showing order visibility and re-entry watch conditions instead of a blank state.</div></div>${watchHtml}`;
       } else {
@@ -2539,6 +2677,18 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     ))
                 })
                 .collect::<HashMap<_, _>>();
+            let watch_entry_sizing_plans = output
+                .watch_markets
+                .iter()
+                .filter_map(|watch| {
+                    let assessment = watch_assessments.get(&watch.symbol)?;
+                    let checklist = watch_entry_checklists.get(&watch.symbol)?;
+                    Some((
+                        watch.symbol.clone(),
+                        build_watch_entry_sizing_plan(assessment, checklist),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
 
             let payload = DashboardSnapshot {
                 output,
@@ -2547,6 +2697,7 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 setup_assessments,
                 watch_assessments,
                 watch_entry_checklists,
+                watch_entry_sizing_plans,
             };
             (StatusCode::OK, Json(payload)).into_response()
         }
