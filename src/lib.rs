@@ -9,8 +9,8 @@ use rand::RngCore;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -145,6 +145,54 @@ struct IntxPortfolioSummaryResponse {
     portfolios: Vec<IntxPortfolioState>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OrdersResponse {
+    #[serde(default)]
+    orders: Vec<RawOrder>,
+    #[serde(default)]
+    has_next: bool,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrder {
+    order_id: String,
+    product_id: String,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    created_time: Option<String>,
+    #[serde(default)]
+    last_update_time: Option<String>,
+    #[serde(default)]
+    completion_percentage: Option<String>,
+    #[serde(default)]
+    average_filled_price: Option<String>,
+    #[serde(default)]
+    filled_size: Option<String>,
+    #[serde(default)]
+    total_fees: Option<String>,
+    #[serde(default)]
+    trigger_status: Option<String>,
+    #[serde(default)]
+    order_type: Option<String>,
+    #[serde(default)]
+    order_placement_source: Option<String>,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    #[serde(default)]
+    leverage: Option<String>,
+    #[serde(default)]
+    margin_type: Option<String>,
+    #[serde(default)]
+    order_configuration: Value,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct IntxPortfolioState {
     portfolio_uuid: String,
@@ -164,6 +212,8 @@ pub struct Output {
     pub portfolio_count: usize,
     pub analysis_basis: &'static str,
     pub positions: Vec<PositionSummary>,
+    pub open_orders: Vec<OpenOrderSummary>,
+    pub watch_markets: Vec<WatchMarketSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +265,57 @@ pub struct PositionSummary {
     pub projections: ProjectionSummary,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct OpenOrderSummary {
+    pub order_id: String,
+    pub product_id: String,
+    pub side: Option<String>,
+    pub status: String,
+    pub created_time: Option<String>,
+    pub last_update_time: Option<String>,
+    pub order_type: Option<String>,
+    pub trigger_status: Option<String>,
+    pub order_placement_source: Option<String>,
+    pub client_order_id: Option<String>,
+    pub configuration_label: Option<String>,
+    pub base_size: Option<String>,
+    pub quote_size: Option<String>,
+    pub filled_size: Option<String>,
+    pub completion_percentage: Option<String>,
+    pub average_filled_price: Option<String>,
+    pub total_fees: Option<String>,
+    pub limit_price: Option<String>,
+    pub stop_price: Option<String>,
+    pub stop_trigger_price: Option<String>,
+    pub end_time: Option<String>,
+    pub post_only: Option<bool>,
+    pub reduce_only: Option<bool>,
+    pub leverage: Option<String>,
+    pub margin_mode: Option<String>,
+    pub cleanup_candidate: bool,
+    pub cleanup_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct WatchMarketSummary {
+    pub symbol: String,
+    pub display_name: Option<String>,
+    pub underlying_type: Option<String>,
+    pub mark_price: Option<String>,
+    pub index_price: Option<String>,
+    pub price_change_24h_pct: Option<f64>,
+    pub basis_pct: Option<f64>,
+    pub funding_rate_pct: Option<f64>,
+    pub funding_direction: Option<String>,
+    pub funding_intensity: Option<String>,
+    pub open_interest: Option<String>,
+    pub open_interest_notional: Option<f64>,
+    pub max_leverage: Option<String>,
+    pub order_book: Option<OrderBookSummary>,
+    pub market_bias: String,
+    pub signals: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProjectionSummary {
     pub up_1pct_pnl: Option<f64>,
@@ -223,7 +324,7 @@ pub struct ProjectionSummary {
     pub down_3pct_pnl: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct OrderBookSummary {
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
@@ -242,7 +343,7 @@ pub struct OrderBookSummary {
     pub sell_slippage: Vec<SlippageEstimate>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SlippageEstimate {
     pub quote_notional: f64,
     pub average_price: Option<f64>,
@@ -468,6 +569,77 @@ fn fetch_portfolio_summary(
     Ok(response.portfolios)
 }
 
+fn fetch_open_orders(client: &Client, credentials: &Credentials) -> Result<Vec<RawOrder>> {
+    let path = "/api/v3/brokerage/orders/historical/batch";
+    let active_statuses = ["OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"];
+    let mut orders = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut pages_fetched = 0usize;
+
+    loop {
+        if pages_fetched >= 4 {
+            break;
+        }
+        let token = build_jwt(&credentials.api_key, &credentials.api_secret, "GET", path)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("failed to build authorization header")?,
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let mut params = vec![
+            ("product_type", "FUTURE".to_string()),
+            ("contract_expiry_type", "PERPETUAL".to_string()),
+            ("limit", "100".to_string()),
+        ];
+        if let Some(value) = cursor.as_deref() {
+            params.push(("cursor", value.to_string()));
+        }
+
+        let response = client
+            .get(format!("{API_BASE}{path}"))
+            .headers(headers)
+            .query(&params)
+            .send()
+            .with_context(|| format!("request failed for GET {path}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            bail!("Coinbase returned {status} for GET {path}: {body}");
+        }
+
+        let response: OrdersResponse = response
+            .json::<OrdersResponse>()
+            .with_context(|| format!("failed to decode Coinbase JSON for GET {path}"))?;
+        orders.extend(response.orders);
+        pages_fetched += 1;
+        if !response.has_next {
+            break;
+        }
+        let Some(next_cursor) = response.cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+
+    orders.retain(|order| {
+        order.status
+            .as_deref()
+            .map(|status| active_statuses.contains(&status))
+            .unwrap_or(false)
+    });
+    orders.sort_by(|left, right| right.created_time.cmp(&left.created_time));
+    orders.dedup_by(|left, right| left.order_id == right.order_id);
+    Ok(orders)
+}
+
 fn select_portfolio(portfolios: &[Portfolio], requested: Option<&str>) -> Result<Portfolio> {
     if let Some(requested_id) = requested {
         return portfolios
@@ -510,6 +682,136 @@ fn money_value(money: Option<&Money>) -> Option<String> {
 
 fn parse_f64(value: Option<&str>) -> Option<f64> {
     value.and_then(|item| item.parse::<f64>().ok())
+}
+
+fn value_as_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(item) => Some(item.clone()),
+        Value::Number(item) => Some(item.to_string()),
+        Value::Bool(item) => Some(item.to_string()),
+        _ => None,
+    }
+}
+
+fn value_as_bool(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(item) => Some(*item),
+        Value::String(item) => match item.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedOrderConfig {
+    label: Option<String>,
+    base_size: Option<String>,
+    quote_size: Option<String>,
+    limit_price: Option<String>,
+    stop_price: Option<String>,
+    stop_trigger_price: Option<String>,
+    end_time: Option<String>,
+    post_only: Option<bool>,
+    reduce_only: Option<bool>,
+}
+
+fn parse_order_config(config: &Value, extra: &HashMap<String, Value>) -> ParsedOrderConfig {
+    let mut parsed = ParsedOrderConfig::default();
+    let Some(map) = config.as_object() else {
+        parsed.reduce_only = value_as_bool(extra.get("reduce_only").or(extra.get("close_only")));
+        return parsed;
+    };
+
+    let selected = map.iter().find_map(|(label, value)| {
+        value.as_object().and_then(|details| {
+            (!details.is_empty()).then_some((label.as_str(), details))
+        })
+    });
+
+    if let Some((label, details)) = selected {
+        parsed.label = Some(label.to_string());
+        parsed.base_size = value_as_string(details.get("base_size"));
+        parsed.quote_size = value_as_string(details.get("quote_size"));
+        parsed.limit_price = value_as_string(details.get("limit_price"));
+        parsed.stop_price = value_as_string(details.get("stop_price"));
+        parsed.stop_trigger_price = value_as_string(
+            details
+                .get("stop_trigger_price")
+                .or(details.get("stop_direction")),
+        );
+        parsed.end_time = value_as_string(details.get("end_time"));
+        parsed.post_only = value_as_bool(details.get("post_only"));
+        parsed.reduce_only = value_as_bool(
+            details
+                .get("reduce_only")
+                .or(details.get("close_only"))
+                .or(extra.get("reduce_only"))
+                .or(extra.get("close_only")),
+        );
+    } else {
+        parsed.reduce_only = value_as_bool(extra.get("reduce_only").or(extra.get("close_only")));
+    }
+
+    parsed
+}
+
+fn normalize_order_side(side: Option<&str>) -> Option<String> {
+    match side {
+        Some("BUY") => Some("buy".to_string()),
+        Some("SELL") => Some("sell".to_string()),
+        Some(other) if !other.is_empty() => Some(other.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+fn summarize_open_order(
+    order: RawOrder,
+    active_position_symbols: &HashMap<String, String>,
+) -> OpenOrderSummary {
+    let config = parse_order_config(&order.order_configuration, &order.extra);
+    let cleanup_reason = if config.reduce_only == Some(true)
+        && !active_position_symbols.contains_key(&order.product_id)
+    {
+        Some(format!(
+            "No live position is open on {}, but this order is still marked reduce-only.",
+            order.product_id
+        ))
+    } else {
+        None
+    };
+
+    OpenOrderSummary {
+        order_id: order.order_id,
+        product_id: order.product_id,
+        side: normalize_order_side(order.side.as_deref()),
+        status: order.status.unwrap_or_else(|| "unknown".to_string()),
+        created_time: order.created_time,
+        last_update_time: order.last_update_time,
+        order_type: order.order_type,
+        trigger_status: order.trigger_status,
+        order_placement_source: order.order_placement_source,
+        client_order_id: order.client_order_id,
+        configuration_label: config.label,
+        base_size: config.base_size,
+        quote_size: config.quote_size,
+        filled_size: order.filled_size,
+        completion_percentage: order.completion_percentage,
+        average_filled_price: order.average_filled_price,
+        total_fees: order.total_fees,
+        limit_price: config.limit_price,
+        stop_price: config.stop_price,
+        stop_trigger_price: config.stop_trigger_price,
+        end_time: config.end_time,
+        post_only: config.post_only,
+        reduce_only: config.reduce_only,
+        leverage: order.leverage,
+        margin_mode: normalize_margin_mode(order.margin_type.as_deref()),
+        cleanup_candidate: cleanup_reason.is_some(),
+        cleanup_reason,
+    }
 }
 
 pub fn format_opt(value: Option<f64>, decimals: usize) -> Option<String> {
@@ -1078,6 +1380,91 @@ fn analyze_position(
     }
 }
 
+fn summarize_watch_market(
+    symbol: &str,
+    product: Option<&ProductResponse>,
+    product_book: Option<&ProductBookResponse>,
+) -> WatchMarketSummary {
+    let price_change_24h_pct =
+        product.and_then(|item| parse_f64(item.price_percentage_change_24h.as_deref()));
+    let mark_price = product.and_then(|item| parse_f64(item.price.as_deref()));
+    let index_price = product.and_then(product_index_price);
+    let basis_pct = mark_price
+        .zip(index_price)
+        .and_then(|(mark, index)| (index != 0.0).then_some(((mark - index) / index) * 100.0));
+    let funding_rate_pct = product.and_then(product_funding_rate).map(|value| value * 100.0);
+    let funding_direction = funding_rate_pct.map(|value| {
+        if value > 0.0 {
+            "longs paying shorts".to_string()
+        } else if value < 0.0 {
+            "shorts paying longs".to_string()
+        } else {
+            "neutral funding".to_string()
+        }
+    });
+    let funding_intensity = classify_funding_intensity(funding_rate_pct);
+    let open_interest = product.and_then(product_open_interest);
+    let open_interest_notional = open_interest.zip(mark_price).map(|(oi, mark)| oi * mark);
+    let order_book = product_book.and_then(build_order_book_summary);
+    let (market_bias, _, _, mut signals) = compute_market_bias(
+        price_change_24h_pct,
+        basis_pct,
+        funding_rate_pct,
+        funding_intensity.as_deref(),
+    );
+
+    if let Some(book) = order_book.as_ref() {
+        if let Some(spread_bps) = book.spread_bps {
+            signals.push(format!(
+                "Top-of-book spread is {spread_bps:.2} bps in the current snapshot."
+            ));
+        }
+        if let Some(imbalance) = book.top_5_imbalance_pct {
+            let lean = if imbalance > 5.0 {
+                "bid-heavy"
+            } else if imbalance < -5.0 {
+                "ask-heavy"
+            } else {
+                "balanced"
+            };
+            signals.push(format!(
+                "Near-touch depth imbalance is {imbalance:.2}% ({lean})."
+            ));
+        }
+        let buy_5k = book
+            .buy_slippage
+            .iter()
+            .find(|estimate| (estimate.quote_notional - 5_000.0).abs() < 0.5);
+        if let Some(buy) = buy_5k {
+            signals.push(format!(
+                "Estimated $5k aggressive buy slippage is {} bps.",
+                format_opt(buy.slippage_bps, 2)
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ));
+        }
+    }
+
+    WatchMarketSummary {
+        symbol: symbol.to_string(),
+        display_name: product.and_then(product_display_name),
+        underlying_type: product.and_then(product_underlying_type),
+        mark_price: format_opt(mark_price, 2),
+        index_price: format_opt(index_price, 2),
+        price_change_24h_pct,
+        basis_pct,
+        funding_rate_pct,
+        funding_direction,
+        funding_intensity,
+        open_interest: format_opt(open_interest, 2),
+        open_interest_notional,
+        max_leverage: product.and_then(product_max_leverage),
+        order_book,
+        market_bias,
+        signals,
+    }
+}
+
 fn summarize_position(
     position: RawPosition,
     product: Option<&ProductResponse>,
@@ -1130,6 +1517,13 @@ fn summarize_position(
 }
 
 pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
+    load_output_with_watch(portfolio_id, &[])
+}
+
+pub fn load_output_with_watch(
+    portfolio_id: Option<&str>,
+    watch_symbols: &[String],
+) -> Result<Output> {
     let _ = dotenv();
     let credentials = get_credentials()?;
     let client = build_client()?;
@@ -1137,22 +1531,39 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
     let portfolio = select_portfolio(&portfolios, portfolio_id)?;
     let positions = fetch_positions(&client, &credentials, &portfolio.uuid)?;
     let portfolio_states = fetch_portfolio_summary(&client, &credentials, &portfolio.uuid)?;
+    let raw_open_orders = fetch_open_orders(&client, &credentials)?;
 
     let mut product_cache = HashMap::new();
     let mut product_book_cache = HashMap::new();
-    for position in &positions {
+    let mut all_symbols = positions
+        .iter()
+        .map(|position| position.symbol.clone())
+        .collect::<Vec<_>>();
+    all_symbols.extend(watch_symbols.iter().cloned());
+    all_symbols.extend(raw_open_orders.iter().map(|order| order.product_id.clone()));
+    all_symbols.sort();
+    all_symbols.dedup();
+    for symbol in &all_symbols {
         product_cache
-            .entry(position.symbol.clone())
-            .or_insert_with(|| fetch_product(&client, &credentials, &position.symbol));
+            .entry(symbol.clone())
+            .or_insert_with(|| fetch_product(&client, &credentials, symbol));
         product_book_cache
-            .entry(position.symbol.clone())
-            .or_insert_with(|| fetch_product_book(&client, &credentials, &position.symbol));
+            .entry(symbol.clone())
+            .or_insert_with(|| fetch_product_book(&client, &credentials, symbol));
     }
 
     let portfolio_state_lookup: HashMap<&str, &IntxPortfolioState> = portfolio_states
         .iter()
         .map(|state| (state.portfolio_uuid.as_str(), state))
         .collect();
+
+    let active_position_symbols = positions
+        .iter()
+        .filter_map(|position| {
+            normalize_side(position.position_side.as_deref())
+                .map(|side| (position.symbol.clone(), side))
+        })
+        .collect::<HashMap<_, _>>();
 
     let positions = positions
         .into_iter()
@@ -1175,6 +1586,32 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
         })
         .collect::<Vec<_>>();
 
+    let mut open_orders = raw_open_orders
+        .into_iter()
+        .map(|order| summarize_open_order(order, &active_position_symbols))
+        .collect::<Vec<_>>();
+    open_orders.sort_by(|left, right| right.created_time.cmp(&left.created_time));
+
+    let position_symbol_set = positions
+        .iter()
+        .map(|position| position.symbol.clone())
+        .collect::<HashSet<_>>();
+    let mut watch_symbols = watch_symbols.to_vec();
+    watch_symbols.extend(open_orders.iter().map(|order| order.product_id.clone()));
+    watch_symbols.sort();
+    watch_symbols.dedup();
+    let watch_markets = watch_symbols
+        .into_iter()
+        .filter(|symbol| !position_symbol_set.contains(symbol))
+        .map(|symbol| {
+            let product = product_cache.get(&symbol).and_then(|result| result.as_ref().ok());
+            let product_book = product_book_cache
+                .get(&symbol)
+                .and_then(|result| result.as_ref().ok());
+            summarize_watch_market(&symbol, product, product_book)
+        })
+        .collect::<Vec<_>>();
+
     Ok(Output {
         credential_source: credentials.source,
         portfolio: PortfolioSummary {
@@ -1184,6 +1621,8 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
         portfolio_count: portfolios.len(),
         analysis_basis: ANALYSIS_BASIS,
         positions,
+        open_orders,
+        watch_markets,
     })
 }
 
@@ -1349,6 +1788,97 @@ fn render_position_lines(index: usize, position: &PositionSummary) -> String {
     lines.join("\n")
 }
 
+fn render_open_order_lines(index: usize, order: &OpenOrderSummary) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Order {}. {} {} {}",
+        index + 1,
+        order.product_id,
+        order.side.as_deref().unwrap_or("unknown"),
+        order.status
+    ));
+    lines.push(format!(
+        "   Config: {} | type={} | reduceOnly={} | base={} | limit={} | stop={} | trigger={} | created={}",
+        order
+            .configuration_label
+            .as_deref()
+            .unwrap_or("unknown"),
+        order.order_type.as_deref().unwrap_or("unknown"),
+        order
+            .reduce_only
+            .map(|value| value.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        order.base_size.as_deref().unwrap_or("unknown"),
+        order.limit_price.as_deref().unwrap_or("n/a"),
+        order.stop_price.as_deref().unwrap_or("n/a"),
+        order.stop_trigger_price.as_deref().unwrap_or("n/a"),
+        order.created_time.as_deref().unwrap_or("unknown"),
+    ));
+    if let Some(reason) = order.cleanup_reason.as_deref() {
+        lines.push(format!("   Cleanup: {reason}"));
+    }
+    lines.join("\n")
+}
+
+fn render_watch_market_lines(index: usize, watch: &WatchMarketSummary) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Watch {}. {}{}",
+        index + 1,
+        watch.symbol,
+        watch
+            .display_name
+            .as_deref()
+            .map(|item| format!(" ({item})"))
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "   Market: mark={} | index={} | 24h={} | basis={} | funding={} ({}, {}) | bias={}",
+        watch.mark_price.as_deref().unwrap_or("unknown"),
+        watch.index_price.as_deref().unwrap_or("unknown"),
+        format_pct(watch.price_change_24h_pct)
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_pct(watch.basis_pct).as_deref().unwrap_or("unknown"),
+        format_opt(watch.funding_rate_pct, 4)
+            .map(|item| format!("{item}%"))
+            .as_deref()
+            .unwrap_or("unknown"),
+        watch
+            .funding_direction
+            .as_deref()
+            .unwrap_or("unknown funding"),
+        watch
+            .funding_intensity
+            .as_deref()
+            .unwrap_or("unclassified"),
+        watch.market_bias,
+    ));
+    if let Some(book) = watch.order_book.as_ref() {
+        lines.push(format!(
+            "   Execution: spread={} bps | top5Imbalance={} | buy5k={} bps | buy10k={} bps",
+            format_opt(book.spread_bps, 2).as_deref().unwrap_or("unknown"),
+            format_pct(book.top_5_imbalance_pct)
+                .as_deref()
+                .unwrap_or("unknown"),
+            book.buy_slippage
+                .iter()
+                .find(|estimate| (estimate.quote_notional - 5_000.0).abs() < 0.5)
+                .and_then(|estimate| format_opt(estimate.slippage_bps, 2))
+                .as_deref()
+                .unwrap_or("unknown"),
+            book.buy_slippage
+                .iter()
+                .find(|estimate| (estimate.quote_notional - 10_000.0).abs() < 0.5)
+                .and_then(|estimate| format_opt(estimate.slippage_bps, 2))
+                .as_deref()
+                .unwrap_or("unknown"),
+        ));
+    }
+    lines.join("\n")
+}
+
 pub fn render_cli_output(output: &Output) -> String {
     let mut lines = vec![
         format!("Credential source: {}", output.credential_source),
@@ -1359,15 +1889,29 @@ pub fn render_cli_output(output: &Output) -> String {
         format!("Portfolio count: {}", output.portfolio_count),
         format!("Analysis basis: {}", output.analysis_basis),
         format!("Open positions: {}", output.positions.len()),
+        format!("Open orders: {}", output.open_orders.len()),
     ];
-
-    if output.positions.is_empty() {
-        lines.push("No open perp positions found.".to_string());
-        return lines.join("\n");
-    }
 
     for (index, position) in output.positions.iter().enumerate() {
         lines.push(render_position_lines(index, position));
+    }
+
+    if output.positions.is_empty() {
+        lines.push("No open perp positions found.".to_string());
+    }
+
+    if !output.open_orders.is_empty() {
+        lines.push("Open orders:".to_string());
+        for (index, order) in output.open_orders.iter().enumerate() {
+            lines.push(render_open_order_lines(index, order));
+        }
+    }
+
+    if !output.watch_markets.is_empty() {
+        lines.push("Watch markets:".to_string());
+        for (index, watch) in output.watch_markets.iter().enumerate() {
+            lines.push(render_watch_market_lines(index, watch));
+        }
     }
 
     lines.join("\n")

@@ -138,6 +138,9 @@ The dashboard also adds a conservative setup layer:
 - current coverage includes FOMC, CPI, jobs, PCE, GDP, retail sales, and PPI
 - a heuristic scheduled-macro risk level
 - a heuristic setup status and suggested max leverage per position
+- live open-order visibility for current futures/perpetual orders
+- stale reduce-only cleanup review when no matching position is open
+- flat-mode re-entry watch cards for recently tracked symbols
 
 Earnings and geopolitical headlines are not yet scored in the risk model. This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
 
@@ -226,6 +229,8 @@ Trend-style interpretations such as "build" or "unwind" require history, not one
 8. Persists that dashboard history to a local JSON file so it survives restarts
 9. Maintains longer-horizon `5` minute rollups so the dashboard can compare current microstructure against a broader recent baseline
 10. In dashboard mode, loads official Fed policy headlines plus scheduled macro events from the FOMC calendar and White House / OIRA release schedule, then derives a conservative setup/leverage assessment
+11. Pulls recent futures/perpetual orders and filters for active orders so the dashboard can show open orders and stale reduce-only cleanup candidates
+12. When no position is open, keeps live watch-market snapshots for recently tracked symbols so the dashboard remains useful in flat mode
 
 The Rust binaries call Coinbase's REST API directly. They enrich the raw position snapshot with product metadata, portfolio summary data, and live product-book data so the output can show additional context without placing trades.
 
@@ -237,6 +242,7 @@ The dashboard uses the same Rust analysis path. Coinbase credentials stay in the
 - Product-book depth is pulled from Coinbase's public `market/product_book` endpoint with `cache-control: no-cache`
 - Both Rust binaries are read-only and target the same INTX portfolio/positions workflow
 - The analytics layer is shared between the CLI and dashboard
+- The orders view uses Coinbase's recent orders endpoint and client-side filtering for active-like futures/perpetual orders
 - The heuristic analytics are context, not a predictive trading model
 - The dashboard is local-only by default, uses the same read-only Rust snapshot pipeline, stores rolling history in a local JSON file, and derives longer-horizon `5` minute rollups from those persisted samples
 

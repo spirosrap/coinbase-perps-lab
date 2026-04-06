@@ -6,7 +6,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{Datelike, NaiveDate, Utc};
 use clap::Parser;
-use coinbase_perps_lab::{load_output, OrderBookSummary, Output, PositionSummary, SlippageEstimate};
+use coinbase_perps_lab::{
+    load_output_with_watch, OrderBookSummary, Output, PositionSummary, SlippageEstimate,
+    WatchMarketSummary,
+};
 use pdf_extract::extract_text_from_mem;
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -128,6 +131,7 @@ struct DashboardSnapshot {
     position_history: HashMap<String, PositionHistorySummary>,
     market_context: MarketContext,
     setup_assessments: HashMap<String, TradeSetupAssessment>,
+    watch_assessments: HashMap<String, TradeSetupAssessment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -779,9 +783,8 @@ fn sample_id(book: Option<&OrderBookSummary>) -> String {
         .unwrap_or_else(|| sample_label(book))
 }
 
-fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
-    let book = position.order_book.as_ref()?;
-    Some(PositionHistorySample {
+fn history_sample_for_symbol(_symbol: &str, book: &OrderBookSummary) -> PositionHistorySample {
+    PositionHistorySample {
         id: sample_id(Some(book)),
         label: sample_label(Some(book)),
         recorded_at_ms: now_millis(),
@@ -791,6 +794,39 @@ fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
         buy_40k_bps: find_slippage_bps(&book.buy_slippage, 40_000.0),
         sell_10k_bps: find_slippage_bps(&book.sell_slippage, 10_000.0),
         sell_40k_bps: find_slippage_bps(&book.sell_slippage, 40_000.0),
+    }
+}
+
+fn upsert_history_sample(
+    history: &mut HashMap<String, PersistedSymbolHistory>,
+    symbol: &str,
+    sample: PositionHistorySample,
+) {
+    let symbol_history = history.entry(symbol.to_string()).or_default();
+    if symbol_history
+        .recent
+        .last()
+        .map(|existing| existing.id == sample.id)
+        .unwrap_or(false)
+    {
+        if let Some(last) = symbol_history.recent.last_mut() {
+            *last = sample;
+        }
+    } else {
+        symbol_history.recent.push(sample.clone());
+        push_sample_into_rollups(&mut symbol_history.rollups, &sample);
+    }
+}
+
+fn history_sample(position: &PositionSummary) -> Option<PositionHistorySample> {
+    let book = position.order_book.as_ref()?;
+    Some(history_sample_for_symbol(&position.symbol, book))
+}
+
+fn watch_history_sample(watch: &WatchMarketSummary) -> Option<PositionHistorySample> {
+    let book = watch.order_book.as_ref()?;
+    Some(PositionHistorySample {
+        ..history_sample_for_symbol(&watch.symbol, book)
     })
 }
 
@@ -802,21 +838,13 @@ fn upsert_history(
         let Some(sample) = history_sample(position) else {
             continue;
         };
-
-        let symbol_history = history.entry(position.symbol.clone()).or_default();
-        if symbol_history
-            .recent
-            .last()
-            .map(|existing| existing.id == sample.id)
-            .unwrap_or(false)
-        {
-            if let Some(last) = symbol_history.recent.last_mut() {
-                *last = sample;
-            }
-        } else {
-            symbol_history.recent.push(sample.clone());
-            push_sample_into_rollups(&mut symbol_history.rollups, &sample);
-        }
+        upsert_history_sample(history, &position.symbol, sample);
+    }
+    for watch in &output.watch_markets {
+        let Some(sample) = watch_history_sample(watch) else {
+            continue;
+        };
+        upsert_history_sample(history, &watch.symbol, sample);
     }
     trim_history(history);
 
@@ -1074,12 +1102,15 @@ fn summarize_position_history(history: &PersistedSymbolHistory) -> PositionHisto
     }
 }
 
-fn assess_trade_setup(
-    position: &PositionSummary,
+fn assess_directional_setup(
+    side: &str,
+    market_bias: &str,
+    funding_rate_pct: Option<f64>,
+    funding_direction: Option<&str>,
+    order_book: Option<&OrderBookSummary>,
     history: Option<&PositionHistorySummary>,
     market_context: &MarketContext,
 ) -> TradeSetupAssessment {
-    let side = position.side.as_deref().unwrap_or("long");
     let mut suggested_max_leverage: f64 = 5.0;
     let mut notes = Vec::new();
     let mut penalties = 0usize;
@@ -1105,9 +1136,7 @@ fn assess_trade_setup(
         _ => {}
     }
 
-    let (slip_5k, slip_10k) = position
-        .order_book
-        .as_ref()
+    let (slip_5k, slip_10k) = order_book
         .map(|book| {
             let estimates = if side == "short" {
                 &book.sell_slippage
@@ -1137,11 +1166,7 @@ fn assess_trade_setup(
     }
     .to_string();
 
-    if let Some(imbalance) = position
-        .order_book
-        .as_ref()
-        .and_then(|book| book.top_5_imbalance_pct)
-    {
+    if let Some(imbalance) = order_book.and_then(|book| book.top_5_imbalance_pct) {
         let adverse = match side {
             "long" => imbalance <= -15.0,
             "short" => imbalance >= 15.0,
@@ -1175,7 +1200,7 @@ fn assess_trade_setup(
     }
 
     let bias_against_trade = matches!(
-        (side, position.market_bias.as_str()),
+        (side, market_bias),
         ("long", "mildly bearish" | "bearish")
             | ("short", "mildly bullish" | "bullish")
     );
@@ -1184,14 +1209,11 @@ fn assess_trade_setup(
         penalties += 1;
         notes.push(format!(
             "The current heuristic market bias ({}) is working against a {side} trade.",
-            position.market_bias
+            market_bias
         ));
     }
 
-    if let (Some(funding), Some(direction)) = (
-        position.funding_rate_pct,
-        position.funding_direction.as_deref(),
-    ) {
+    if let (Some(funding), Some(direction)) = (funding_rate_pct, funding_direction) {
         let adverse = (side == "long" && direction == "longs paying shorts" && funding.abs() >= 0.02)
             || (side == "short" && direction == "shorts paying longs" && funding.abs() >= 0.02);
         if adverse {
@@ -1253,6 +1275,44 @@ fn assess_trade_setup(
         execution_risk,
         notes,
     }
+}
+
+fn assess_trade_setup(
+    position: &PositionSummary,
+    history: Option<&PositionHistorySummary>,
+    market_context: &MarketContext,
+) -> TradeSetupAssessment {
+    assess_directional_setup(
+        position.side.as_deref().unwrap_or("long"),
+        &position.market_bias,
+        position.funding_rate_pct,
+        position.funding_direction.as_deref(),
+        position.order_book.as_ref(),
+        history,
+        market_context,
+    )
+}
+
+fn assess_watch_setup(
+    watch: &WatchMarketSummary,
+    history: Option<&PositionHistorySummary>,
+    market_context: &MarketContext,
+) -> TradeSetupAssessment {
+    let mut assessment = assess_directional_setup(
+        "long",
+        &watch.market_bias,
+        watch.funding_rate_pct,
+        watch.funding_direction.as_deref(),
+        watch.order_book.as_ref(),
+        history,
+        market_context,
+    );
+    assessment.notes.insert(
+        0,
+        "You are flat. Treat this as a long re-entry watch, not a requirement to trade."
+            .to_string(),
+    );
+    assessment
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -1844,6 +1904,133 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
+    function openOrdersPanel(orders) {
+      const stale = (orders || []).filter((order) => order.cleanup_candidate);
+      const staleBanner = stale.length
+        ? `<div class="signal-note negative">Stale reduce-only cleanup review: ${stale.length} open order(s) appear tied to no live position.</div>`
+        : `<div class="signal-note">No obvious stale reduce-only cleanup candidates were detected.</div>`;
+      const cards = (orders || []).map((order) => {
+        const meta = [
+          order.order_type || "unknown",
+          order.configuration_label || "unknown config",
+          order.reduce_only === true ? "reduce-only" : (order.reduce_only === false ? "not reduce-only" : "reduce-only unknown"),
+        ].join(" | ");
+        const reason = order.cleanup_reason ? `<div class="signal-note negative">${escapeHtml(order.cleanup_reason)}</div>` : "";
+        return `
+          <article class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">${escapeHtml(order.product_id)}</h2>
+                <div class="subtext">${escapeHtml(order.side || "unknown")} | ${escapeHtml(order.status || "unknown")} | ${escapeHtml(meta)}</div>
+              </div>
+              <div class="badges">
+                <span class="badge ${badgeClass(order.cleanup_candidate ? "high" : "low")}">${order.cleanup_candidate ? "cleanup review" : "open order"}</span>
+              </div>
+            </div>
+            <div class="stats-grid">
+              ${statCard("Base Size", order.base_size || "unknown")}
+              ${statCard("Filled", order.filled_size || "unknown")}
+              ${statCard("Complete", order.completion_percentage ? `${escapeHtml(order.completion_percentage)}%` : "unknown")}
+              ${statCard("Limit", order.limit_price || "n/a")}
+              ${statCard("Stop", order.stop_price || "n/a")}
+              ${statCard("Trigger", order.stop_trigger_price || "n/a")}
+              ${statCard("Avg Fill", order.average_filled_price || "unknown")}
+              ${statCard("Fees", order.total_fees || "unknown")}
+              ${statCard("Created", order.created_time ? shortId(order.created_time, 16, 8) : "unknown")}
+              ${statCard("Updated", order.last_update_time ? shortId(order.last_update_time, 16, 8) : "unknown")}
+            </div>
+            ${reason}
+          </article>
+        `;
+      }).join("");
+
+      return `
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Open Orders</h2>
+              <div class="subtext">Live Advanced Trade future/perpetual orders visible to this key.</div>
+            </div>
+          </div>
+          ${staleBanner}
+        </section>
+        ${cards || `<div class="empty"><h2>No open orders</h2><div class="empty-copy">No active future/perpetual orders are currently visible for this portfolio.</div></div>`}
+      `;
+    }
+
+    function watchCard(watch, history, assessment) {
+      const displayName = watch.display_name ? ` (${escapeHtml(watch.display_name)})` : "";
+      const spreadValue = watch.order_book?.spread_absolute != null || watch.order_book?.spread_bps != null
+        ? `${formatMaybe(watch.order_book?.spread_absolute, 4)} | ${formatBps(watch.order_book?.spread_bps)}`
+        : "unknown";
+      const historyInsights = (history?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const longInsights = (history?.long_horizon?.insights || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+      const watchNotes = (assessment?.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+      const signals = (watch.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
+
+      return `
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">${escapeHtml(watch.symbol)}${displayName}</h2>
+              <div class="subtext">Flat-mode re-entry watch | Underlying: ${escapeHtml(watch.underlying_type || "unknown")}</div>
+            </div>
+            <div class="badges">
+              <span class="badge ${badgeClass(assessment?.alignment_status || watch.market_bias)}">${escapeHtml(assessment?.alignment_status || watch.market_bias)}</span>
+              <span class="badge neutral">${escapeHtml((assessment?.alignment_confidence || "low") + " confidence")}</span>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            ${statCard("Mark", watch.mark_price || "unknown")}
+            ${statCard("Index", watch.index_price || "unknown")}
+            ${statCard("24h Change", formatPct(watch.price_change_24h_pct), toneClass(watch.price_change_24h_pct))}
+            ${statCard("Basis", formatPct(watch.basis_pct), toneClass(watch.basis_pct))}
+            ${statCard("Funding", watch.funding_rate_pct != null ? `${formatMaybe(watch.funding_rate_pct, 4)}%` : "unknown", toneClass(watch.funding_rate_pct))}
+            ${statCard("Funding Context", watch.funding_direction && watch.funding_intensity ? `${watch.funding_direction} (${watch.funding_intensity})` : (watch.funding_direction || watch.funding_intensity || "unknown"))}
+            ${statCard("Open Interest", watch.open_interest || "unknown")}
+            ${statCard("OI Notional", watch.open_interest_notional != null ? formatMaybe(watch.open_interest_notional, 2) : "unknown")}
+            ${statCard("Spread", spreadValue)}
+            ${statCard("Top 5 Imbalance", watch.order_book?.top_5_imbalance_pct != null ? formatPct(watch.order_book.top_5_imbalance_pct) : "unknown", toneClass(watch.order_book?.top_5_imbalance_pct))}
+            ${statCard("Macro Risk", assessment?.event_risk || "unknown", badgeClass(assessment?.event_risk || ""))}
+            ${statCard("Execution Risk", assessment?.execution_risk || "unknown", badgeClass(assessment?.execution_risk || ""))}
+            ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
+          </div>
+
+          <div class="execution-grid">
+            ${executionPanel("Buy Slippage vs Best Ask", watch.order_book?.buy_slippage, "buy")}
+            ${executionPanel("Sell Slippage vs Best Bid", watch.order_book?.sell_slippage, "sell")}
+          </div>
+
+          <div class="history-grid">
+            ${historyPanel("Spread History", history?.spread_bps, " bps", 2)}
+            ${historyPanel("Top 5 Imbalance History", history?.top_5_imbalance_pct, "%", 2)}
+            ${historyPanel("Buy $10k Slip History", history?.buy_10k_bps, " bps", 2)}
+            ${historyPanel("Buy $40k Slip History", history?.buy_40k_bps, " bps", 2)}
+          </div>
+
+          <div class="history-meta">History window: ${history ? `${history.samples} samples, ~${formatMaybe(history.approx_window_minutes, 1)} min, latest ${history.latest_label || "unknown"}` : "building from the first snapshot"}</div>
+          <ul class="history-insights">${historyInsights}</ul>
+
+          <div class="history-grid">
+            ${historyPanel("Long Spread Trend", history?.long_horizon?.spread_bps, " bps", 2)}
+            ${historyPanel("Long Imbalance Trend", history?.long_horizon?.top_5_imbalance_pct, "%", 2)}
+            ${historyPanel("Long Buy $40k Slip", history?.long_horizon?.buy_40k_bps, " bps", 2)}
+            ${historyPanel("Long Sell $40k Slip", history?.long_horizon?.sell_40k_bps, " bps", 2)}
+          </div>
+
+          <div class="history-meta">Robust window: ${history?.long_horizon ? `${history.long_horizon.buckets} buckets x ${formatMaybe(history.long_horizon.bucket_minutes, 0)} min, ~${formatMaybe(history.long_horizon.approx_window_hours, 1)} h, latest ${history.long_horizon.latest_label || "unknown"}` : "building from rollups"}</div>
+          <ul class="history-insights">${longInsights}</ul>
+
+          <div class="signal-note">Re-entry watch is a conservative heuristic. It is not a signal to trade by itself.</div>
+          <ul class="history-insights">${watchNotes}</ul>
+
+          <div class="signal-note">Watch signals are derived from live product and product-book fields while you are flat.</div>
+          <ul class="signals">${signals}</ul>
+        </article>
+      `;
+    }
+
     function positionCard(pos, history, assessment) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
@@ -1947,10 +2134,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function render(snapshot) {
       latestSnapshot = snapshot;
       const first = snapshot.positions[0];
-      const firstSetup = first ? snapshot.setup_assessments?.[first.symbol] : null;
+      const firstWatch = snapshot.watch_markets?.[0];
+      const firstSetup = first
+        ? snapshot.setup_assessments?.[first.symbol]
+        : (firstWatch ? snapshot.watch_assessments?.[firstWatch.symbol] : null);
+      const staleCount = (snapshot.open_orders || []).filter((order) => order.cleanup_candidate).length;
       document.getElementById("analysisBasis").textContent = snapshot.analysis_basis || "";
       document.getElementById("heroGrid").innerHTML = [
         metricCard("Positions", String(snapshot.positions.length)),
+        metricCard("Open Orders", String((snapshot.open_orders || []).length)),
         metricCard(
           "Portfolio",
           snapshot.portfolio?.portfolio_type || "unknown",
@@ -1961,14 +2153,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         metricCard("Setup Status", firstSetup?.alignment_status || "no position"),
         metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
         metricCard("Suggested Max Lev", firstSetup?.suggested_max_leverage != null ? `${formatMaybe(firstSetup.suggested_max_leverage, 0)}x` : "unknown"),
-        metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "unknown"),
+        metricCard("Stale Cleanup", String(staleCount)),
+        metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "flat"),
       ].join("");
 
       const cards = document.getElementById("cards");
       if (!snapshot.positions.length) {
-        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">The dashboard is live, but Coinbase returned no open INTX perpetual positions.</div></div>`;
+        const watchHtml = (snapshot.watch_markets || []).length
+          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol])).join("")
+          : `<div class="empty"><h2>No watch markets yet</h2><div class="empty-copy">Build history on a symbol or leave a related order open to keep a live flat-mode watch here.</div></div>`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is now showing order visibility and re-entry watch conditions instead of a blank state.</div></div>${watchHtml}`;
       } else {
-        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol])).join("")}`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol])).join("")}`;
       }
     }
 
@@ -2036,11 +2232,37 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(html)
 }
 
+fn derive_watch_symbols(history: &HashMap<String, PersistedSymbolHistory>) -> Vec<String> {
+    let mut ranked = history
+        .iter()
+        .filter_map(|(symbol, item)| {
+            let latest = item
+                .recent
+                .last()
+                .map(|sample| sample.recorded_at_ms)
+                .or_else(|| item.rollups.last().map(|bucket| bucket.bucket_start_ms))?;
+            Some((symbol.clone(), latest))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1));
+    ranked.into_iter().map(|(symbol, _)| symbol).take(3).collect()
+}
+
 async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let portfolio = state.portfolio.clone();
+    let watch_symbols = match state.history.lock() {
+        Ok(history) => derive_watch_symbols(&history),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Dashboard history lock is poisoned".to_string(),
+            )
+                .into_response()
+        }
+    };
 
     match tokio::task::spawn_blocking(move || -> Result<(Output, MarketContext)> {
-        let output = load_output(portfolio.as_deref())?;
+        let output = load_output_with_watch(portfolio.as_deref(), &watch_symbols)?;
         let client = build_http_client()?;
         let market_context = load_market_context(&client);
         Ok((output, market_context))
@@ -2079,12 +2301,24 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     )
                 })
                 .collect::<HashMap<_, _>>();
+            let watch_assessments = output
+                .watch_markets
+                .iter()
+                .map(|watch| {
+                    let history = position_history.get(&watch.symbol);
+                    (
+                        watch.symbol.clone(),
+                        assess_watch_setup(watch, history, &market_context),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
 
             let payload = DashboardSnapshot {
                 output,
                 position_history,
                 market_context,
                 setup_assessments,
+                watch_assessments,
             };
             (StatusCode::OK, Json(payload)).into_response()
         }
