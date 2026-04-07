@@ -4,7 +4,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::America::New_York;
 use clap::Parser;
 use coinbase_perps_lab::{
     load_output_with_watch, OrderBookSummary, Output, PositionSummary, SlippageEstimate,
@@ -44,6 +45,33 @@ const OMB_PFEI_PDF_URL_PATTERN: &str =
 const GOOGLE_NEWS_GEOPOLITICS_RSS_URL: &str = "https://news.google.com/rss/search?q=%28Iran%20OR%20Israel%20OR%20Ukraine%20OR%20Russia%20OR%20China%20OR%20Taiwan%20OR%20oil%20OR%20tariffs%20OR%20sanctions%20OR%20shipping%29%20when%3A7d&hl=en-US&gl=US&ceid=US:en";
 const US_EQUITY_EARNINGS_PROXY_TICKERS: [&str; 7] =
     ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"];
+
+#[derive(Debug, Clone, Copy)]
+enum PredictionTargetKind {
+    FixedMinutes(u32),
+    UsCashClose,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PredictionTarget {
+    label: &'static str,
+    kind: PredictionTargetKind,
+}
+
+const MODEL_TARGETS: [PredictionTarget; 3] = [
+    PredictionTarget {
+        label: "1h",
+        kind: PredictionTargetKind::FixedMinutes(60),
+    },
+    PredictionTarget {
+        label: "4h",
+        kind: PredictionTargetKind::FixedMinutes(240),
+    },
+    PredictionTarget {
+        label: "next close",
+        kind: PredictionTargetKind::UsCashClose,
+    },
+];
 
 #[derive(Parser, Debug)]
 #[command(about = "Serve a local web dashboard for Coinbase INTX perp analytics.")]
@@ -383,6 +411,7 @@ struct EntrySizingPlan {
 
 #[derive(Debug, Clone, Serialize)]
 struct ModelPrediction {
+    horizon_label: String,
     variant: String,
     status: String,
     horizon_minutes: u32,
@@ -409,6 +438,15 @@ struct ModelPrediction {
     hours_until_activation: f64,
     summary: String,
     notes: Vec<String>,
+    additional_horizons: Vec<ModelPrediction>,
+}
+
+#[derive(Debug, Clone)]
+struct LabeledFeatureSample {
+    source_index: usize,
+    target_index: usize,
+    features: Vec<f64>,
+    label: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,6 +530,97 @@ fn apply_model_readiness(prediction: &mut ModelPrediction, history: Option<&Pers
     prediction.rollup_hours_collected = rollup_buckets_to_hours(bucket_count);
     prediction.buckets_until_activation = buckets_until_activation;
     prediction.hours_until_activation = rollup_buckets_to_hours(buckets_until_activation);
+}
+
+fn target_horizon_minutes(target: PredictionTarget) -> u32 {
+    match target.kind {
+        PredictionTargetKind::FixedMinutes(minutes) => minutes,
+        PredictionTargetKind::UsCashClose => 0,
+    }
+}
+
+fn next_us_trading_day(mut date: NaiveDate) -> NaiveDate {
+    loop {
+        date += Duration::days(1);
+        match date.weekday() {
+            Weekday::Sat | Weekday::Sun => continue,
+            _ => return date,
+        }
+    }
+}
+
+fn next_us_cash_close_timestamp(after_ts: i64) -> Option<i64> {
+    let current_utc = Utc.timestamp_opt(after_ts, 0).single()?;
+    let current_local = current_utc.with_timezone(&New_York);
+    let close_time = NaiveTime::from_hms_opt(16, 0, 0)?;
+    let current_date = current_local.date_naive();
+    let target_date = match current_local.weekday() {
+        Weekday::Sat | Weekday::Sun => next_us_trading_day(current_date),
+        _ if current_local.time() < close_time => current_date,
+        _ => next_us_trading_day(current_date),
+    };
+    let target_local = New_York
+        .from_local_datetime(&NaiveDateTime::new(target_date, close_time))
+        .single()?;
+    Some(target_local.with_timezone(&Utc).timestamp())
+}
+
+fn target_index_for_candle(
+    candles: &[CandleBar],
+    source_index: usize,
+    target: PredictionTarget,
+) -> Option<usize> {
+    let source = candles.get(source_index)?;
+    let target_index = match target.kind {
+        PredictionTargetKind::FixedMinutes(minutes) => {
+            let bars = (minutes / MODEL_GRANULARITY_MINUTES) as usize;
+            source_index.checked_add(bars)?
+        }
+        PredictionTargetKind::UsCashClose => {
+            let target_ts = next_us_cash_close_timestamp(source.start)?;
+            candle_index_at_or_before(candles, target_ts)?
+        }
+    };
+    (target_index > source_index && target_index < candles.len()).then_some(target_index)
+}
+
+fn empty_prediction_shell(
+    target: PredictionTarget,
+    variant: &str,
+    status: &str,
+    summary: String,
+    notes: Vec<String>,
+) -> ModelPrediction {
+    ModelPrediction {
+        horizon_label: target.label.to_string(),
+        variant: variant.to_string(),
+        status: status.to_string(),
+        horizon_minutes: target_horizon_minutes(target),
+        granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+        evaluation_method: "Expanding walk-forward on non-overlapping holdout anchors".to_string(),
+        probability_up: None,
+        probability_down: None,
+        model_bias: "unknown".to_string(),
+        confidence: "low".to_string(),
+        training_samples: 0,
+        test_samples: 0,
+        test_accuracy: None,
+        baseline_accuracy: None,
+        edge_vs_baseline_pct_points: None,
+        brier_score: None,
+        holdout_up_rate: None,
+        majority_label: None,
+        balanced_accuracy: None,
+        matthews_corrcoef: None,
+        readiness_stage: "collecting".to_string(),
+        rollup_buckets_collected: 0,
+        rollup_hours_collected: 0.0,
+        buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
+        hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
+        summary,
+        notes,
+        additional_horizons: Vec::new(),
+    }
 }
 
 fn format_pct(value: Option<f64>) -> Option<String> {
@@ -888,22 +1017,45 @@ fn fit_logistic_model(features: &[Vec<f64>], labels: &[f64]) -> Option<LogisticM
     })
 }
 
-fn evaluate_walk_forward(
-    features: &[Vec<f64>],
-    labels: &[f64],
-    horizon_step: usize,
-) -> Option<ModelEvaluation> {
-    let split_index = model_split_index(features.len())?;
+fn evaluate_walk_forward(samples: &[LabeledFeatureSample]) -> Option<ModelEvaluation> {
+    let split_index = model_split_index(samples.len())?;
     let mut predictions = Vec::new();
     let mut holdout_labels = Vec::new();
+    let mut last_target_index = None;
     let mut test_index = split_index;
-    let step = horizon_step.max(1);
 
-    while test_index < features.len() {
-        let model = fit_logistic_model(&features[..test_index], &labels[..test_index])?;
-        predictions.push(model.predict_probability(&features[test_index]));
-        holdout_labels.push(labels[test_index]);
-        test_index = test_index.saturating_add(step);
+    while test_index < samples.len() {
+        let sample = samples.get(test_index)?;
+        if last_target_index
+            .map(|last| sample.source_index <= last)
+            .unwrap_or(false)
+        {
+            test_index += 1;
+            continue;
+        }
+
+        let training = samples[..test_index]
+            .iter()
+            .filter(|candidate| candidate.target_index < sample.source_index)
+            .collect::<Vec<_>>();
+        if training.len() < 80 {
+            test_index += 1;
+            continue;
+        }
+
+        let train_features = training
+            .iter()
+            .map(|item| item.features.clone())
+            .collect::<Vec<_>>();
+        let train_labels = training
+            .iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        let model = fit_logistic_model(&train_features, &train_labels)?;
+        predictions.push(model.predict_probability(&sample.features));
+        holdout_labels.push(sample.label);
+        last_target_index = Some(sample.target_index);
+        test_index += 1;
     }
 
     if predictions.is_empty() || predictions.len() != holdout_labels.len() {
@@ -961,7 +1113,7 @@ fn evaluate_walk_forward(
 
     Some(ModelEvaluation {
         evaluation_method:
-            "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
+            "Expanding walk-forward on non-overlapping holdout anchors".to_string(),
         test_samples,
         test_accuracy,
         baseline_accuracy,
@@ -976,104 +1128,94 @@ fn evaluate_walk_forward(
     })
 }
 
-fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -> Result<ModelPrediction> {
-    let horizon_bars = (MODEL_HORIZON_MINUTES / MODEL_GRANULARITY_MINUTES) as usize;
-    if candles.len() < 120 || horizon_bars == 0 {
-        return Ok(ModelPrediction {
-            variant: "candle_only".to_string(),
-            status: "not_enough_data".to_string(),
-            horizon_minutes: MODEL_HORIZON_MINUTES,
-            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
-            evaluation_method:
-                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
-            probability_up: None,
-            probability_down: None,
-            model_bias: "unknown".to_string(),
-            confidence: "low".to_string(),
-            training_samples: 0,
-            test_samples: 0,
-            test_accuracy: None,
-            baseline_accuracy: None,
-            edge_vs_baseline_pct_points: None,
-            brier_score: None,
-            holdout_up_rate: None,
-            majority_label: None,
-            balanced_accuracy: None,
-            matthews_corrcoef: None,
-            readiness_stage: "collecting".to_string(),
-            rollup_buckets_collected: 0,
-            rollup_hours_collected: 0.0,
-            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
-            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            summary: "Not enough candle history is available to build the experimental baseline."
-                .to_string(),
-            notes: vec![
-                "The fallback candle-only model needs several days of 5-minute candles to train and evaluate."
-                    .to_string(),
-            ],
-        });
-    }
-
-    let mut features = Vec::<Vec<f64>>::new();
-    let mut labels = Vec::<f64>::new();
-    for index in 48..candles.len().saturating_sub(horizon_bars) {
-        let Some(vector) = candle_feature_vector(candles, index) else {
+fn candle_samples_for_target(
+    candles: &[CandleBar],
+    target: PredictionTarget,
+) -> Vec<LabeledFeatureSample> {
+    let mut samples = Vec::new();
+    for source_index in 48..candles.len() {
+        let Some(features) = candle_feature_vector(candles, source_index) else {
             continue;
         };
-        let future_close = candles
-            .get(index + horizon_bars)
-            .map(|item| item.close)
-            .unwrap_or(0.0);
-        let current_close = candles.get(index).map(|item| item.close).unwrap_or(0.0);
+        let Some(target_index) = target_index_for_candle(candles, source_index, target) else {
+            continue;
+        };
+        let current_close = candles.get(source_index).map(|item| item.close).unwrap_or(0.0);
+        let future_close = candles.get(target_index).map(|item| item.close).unwrap_or(0.0);
         if current_close <= 0.0 || future_close <= 0.0 {
             continue;
         }
-        features.push(vector);
-        labels.push((future_close > current_close) as u8 as f64);
-    }
-
-    if features.len() < 120 {
-        return Ok(ModelPrediction {
-            variant: "candle_only".to_string(),
-            status: "not_enough_data".to_string(),
-            horizon_minutes: MODEL_HORIZON_MINUTES,
-            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
-            evaluation_method:
-                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
-            probability_up: None,
-            probability_down: None,
-            model_bias: "unknown".to_string(),
-            confidence: "low".to_string(),
-            training_samples: features.len(),
-            test_samples: 0,
-            test_accuracy: None,
-            baseline_accuracy: None,
-            edge_vs_baseline_pct_points: None,
-            brier_score: None,
-            holdout_up_rate: None,
-            majority_label: None,
-            balanced_accuracy: None,
-            matthews_corrcoef: None,
-            readiness_stage: "collecting".to_string(),
-            rollup_buckets_collected: 0,
-            rollup_hours_collected: 0.0,
-            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
-            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            summary: "Not enough feature/label examples are available yet for the experimental model."
-                .to_string(),
-            notes: vec![
-                "The fallback candle-only model discards a longer warm-up window to compute multi-horizon momentum and volatility features."
-                    .to_string(),
-            ],
+        samples.push(LabeledFeatureSample {
+            source_index,
+            target_index,
+            features,
+            label: (future_close > current_close) as u8 as f64,
         });
     }
+    samples
+}
 
-    let evaluation = evaluate_walk_forward(&features, &labels, horizon_bars)
+fn rollup_samples_for_target(
+    history: &PersistedSymbolHistory,
+    candles: &[CandleBar],
+    target: PredictionTarget,
+) -> (Vec<LabeledFeatureSample>, Option<Vec<f64>>) {
+    let mut samples = Vec::new();
+    let mut latest_features = None;
+    for rollup_index in 0..history.rollups.len() {
+        let Some((features, source_index)) = rollup_feature_vector(history, candles, rollup_index) else {
+            continue;
+        };
+        latest_features = Some(features.clone());
+        let Some(target_index) = target_index_for_candle(candles, source_index, target) else {
+            continue;
+        };
+        let current_close = candles.get(source_index).map(|item| item.close).unwrap_or(0.0);
+        let future_close = candles.get(target_index).map(|item| item.close).unwrap_or(0.0);
+        if current_close <= 0.0 || future_close <= 0.0 {
+            continue;
+        }
+        samples.push(LabeledFeatureSample {
+            source_index,
+            target_index,
+            features,
+            label: (future_close > current_close) as u8 as f64,
+        });
+    }
+    (samples, latest_features)
+}
+
+fn build_candle_only_model_prediction(
+    candles: &[CandleBar],
+    product_id: &str,
+    target: PredictionTarget,
+) -> Result<ModelPrediction> {
+    let samples = candle_samples_for_target(candles, target);
+    if samples.len() < 120 {
+        return Ok(empty_prediction_shell(
+            target,
+            "candle_only",
+            "not_enough_data",
+            format!(
+                "Not enough candle-only feature/label examples are available yet for the {} model.",
+                target.label
+            ),
+            vec![
+                "The fallback candle-only model needs substantially more 5-minute candles to evaluate this horizon."
+                    .to_string(),
+            ],
+        ));
+    }
+
+    let evaluation = evaluate_walk_forward(&samples)
         .context("failed to evaluate candle-only walk-forward metrics")?;
     let latest_features = candle_feature_vector(candles, candles.len() - 1)
         .context("failed to build latest candle-only feature vector")?;
-    let latest_model =
-        fit_logistic_model(&features, &labels).context("failed to fit latest candle-only model")?;
+    let latest_model = fit_logistic_model(
+        &samples.iter().map(|item| item.features.clone()).collect::<Vec<_>>(),
+        &samples.iter().map(|item| item.label).collect::<Vec<_>>(),
+    )
+    .context("failed to fit latest candle-only model")?;
     let raw_probability_up = latest_model.predict_probability(&latest_features);
     let validation_edge = evaluation
         .test_accuracy
@@ -1095,164 +1237,73 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
     let model_bias = classify_model_bias(probability_up, &confidence);
     let status = if has_edge { "available" } else { "no_edge" }.to_string();
 
-    let mut notes = vec![format!(
-        "Experimental baseline trained on {} candle-only {}-minute examples with a {}-minute horizon.",
-        features.len(),
-        MODEL_GRANULARITY_MINUTES,
-        MODEL_HORIZON_MINUTES
-    )];
-    notes.push(format!(
-        "Evaluation uses expanding walk-forward scoring on non-overlapping {}-minute holdout anchors.",
-        MODEL_HORIZON_MINUTES
-    ));
-    if let (Some(test), Some(base)) = (evaluation.test_accuracy, evaluation.baseline_accuracy) {
-        notes.push(format!(
-            "Walk-forward holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
-            test * 100.0,
-            base * 100.0
-        ));
-    }
-    if let (Some(up_rate), Some(majority_label)) =
-        (evaluation.holdout_up_rate, evaluation.majority_label.as_deref())
-    {
-        notes.push(format!(
-            "The non-overlapping holdout slice is {:.1}% up labels, so the naive baseline mostly wins by always predicting {}.",
-            up_rate * 100.0,
-            majority_label
-        ));
-    }
-    if has_edge {
-        notes.push(format!(
-            "The current probability is only exposed directionally because the model is ahead of baseline by {:.1} percentage points on the holdout window.",
-            validation_edge * 100.0
-        ));
-    } else {
-        notes.push(
-            "The raw model fit does not currently beat a naive holdout baseline, so the directional output is neutralized to 50/50."
-                .to_string(),
-        );
-    }
-    notes.push(
-        "Inputs are limited to Coinbase public candle price/volatility/volume features. Local microstructure and market-context history are not yet available in sufficient depth."
-            .to_string(),
-    );
-
-    Ok(ModelPrediction {
-        variant: "candle_only".to_string(),
-        status,
-        horizon_minutes: MODEL_HORIZON_MINUTES,
-        granularity: MODEL_CANDLE_GRANULARITY.to_string(),
-        evaluation_method: evaluation.evaluation_method,
-        probability_up: Some(probability_up),
-        probability_down: Some(probability_down),
-        model_bias,
-        confidence,
-        training_samples: features.len(),
-        test_samples: evaluation.test_samples,
-        test_accuracy: evaluation.test_accuracy,
-        baseline_accuracy: evaluation.baseline_accuracy,
-        edge_vs_baseline_pct_points: evaluation.edge_vs_baseline_pct_points,
-        brier_score: evaluation.brier_score,
-        holdout_up_rate: evaluation.holdout_up_rate,
-        majority_label: evaluation.majority_label,
-        balanced_accuracy: evaluation.balanced_accuracy,
-        matthews_corrcoef: evaluation.matthews_corrcoef,
-        readiness_stage: "collecting".to_string(),
-        rollup_buckets_collected: 0,
-        rollup_hours_collected: 0.0,
-        buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
-        hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-        summary: if has_edge {
+    let mut prediction = empty_prediction_shell(
+        target,
+        "candle_only",
+        &status,
+        if has_edge {
             format!(
-                "Experimental baseline estimates a {:.1}% probability that {product_id} is higher in {} minutes.",
+                "Experimental candle-only baseline estimates a {:.1}% probability that {product_id} is higher by {}.",
                 probability_up * 100.0,
-                MODEL_HORIZON_MINUTES
+                target.label
             )
         } else {
             format!(
-                "Experimental baseline does not currently beat a naive holdout baseline for {product_id}; no directional edge is exposed."
+                "Experimental candle-only baseline does not currently beat a naive holdout baseline for {product_id} at {}.",
+                target.label
             )
         },
-        notes,
-    })
+        Vec::new(),
+    );
+    prediction.evaluation_method = evaluation.evaluation_method;
+    prediction.probability_up = Some(probability_up);
+    prediction.probability_down = Some(probability_down);
+    prediction.model_bias = model_bias;
+    prediction.confidence = confidence;
+    prediction.training_samples = samples.len();
+    prediction.test_samples = evaluation.test_samples;
+    prediction.test_accuracy = evaluation.test_accuracy;
+    prediction.baseline_accuracy = evaluation.baseline_accuracy;
+    prediction.edge_vs_baseline_pct_points = evaluation.edge_vs_baseline_pct_points;
+    prediction.brier_score = evaluation.brier_score;
+    prediction.holdout_up_rate = evaluation.holdout_up_rate;
+    prediction.majority_label = evaluation.majority_label;
+    prediction.balanced_accuracy = evaluation.balanced_accuracy;
+    prediction.matthews_corrcoef = evaluation.matthews_corrcoef;
+    prediction.notes = vec![
+        format!(
+            "Experimental candle-only baseline trained on {} examples for the {} horizon.",
+            samples.len(),
+            target.label
+        ),
+        "Features are limited to Coinbase public candle price/volatility/volume.".to_string(),
+    ];
+    Ok(prediction)
 }
 
 fn build_history_augmented_model_prediction(
     history: &PersistedSymbolHistory,
     candles: &[CandleBar],
     product_id: &str,
+    target: PredictionTarget,
 ) -> Result<Option<ModelPrediction>> {
-    let horizon_bars = (MODEL_HORIZON_MINUTES / MODEL_GRANULARITY_MINUTES) as usize;
-    let mut features = Vec::<Vec<f64>>::new();
-    let mut labels = Vec::<f64>::new();
-    let mut latest_features = None;
-
-    for rollup_index in 0..history.rollups.len() {
-        let Some((vector, candle_index)) =
-            rollup_feature_vector(history, candles, rollup_index)
-        else {
-            continue;
-        };
-        if candle_index + horizon_bars >= candles.len() {
-            latest_features = Some(vector);
-            continue;
-        }
-        let current_close = candles.get(candle_index).map(|item| item.close).unwrap_or(0.0);
-        let future_close = candles
-            .get(candle_index + horizon_bars)
-            .map(|item| item.close)
-            .unwrap_or(0.0);
-        if current_close <= 0.0 || future_close <= 0.0 {
-            continue;
-        }
-        if rollup_index + 1 == history.rollups.len() {
-            latest_features = Some(vector.clone());
-        }
-        features.push(vector);
-        labels.push((future_close > current_close) as u8 as f64);
-    }
+    let (samples, latest_features) = rollup_samples_for_target(history, candles, target);
 
     let Some(latest_features) = latest_features else {
         return Ok(None);
     };
-    if features.len() < 120 {
+    if samples.len() < 120 {
         return Ok(None);
     }
 
-    let mut prediction =
-        build_candle_only_model_prediction(candles, product_id).unwrap_or_else(|_| ModelPrediction {
-            variant: "candle_only".to_string(),
-            status: "not_enough_data".to_string(),
-            horizon_minutes: MODEL_HORIZON_MINUTES,
-            granularity: MODEL_CANDLE_GRANULARITY.to_string(),
-            evaluation_method:
-                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
-            probability_up: None,
-            probability_down: None,
-            model_bias: "unknown".to_string(),
-            confidence: "low".to_string(),
-            training_samples: 0,
-            test_samples: 0,
-            test_accuracy: None,
-            baseline_accuracy: None,
-            edge_vs_baseline_pct_points: None,
-            brier_score: None,
-            holdout_up_rate: None,
-            majority_label: None,
-            balanced_accuracy: None,
-            matthews_corrcoef: None,
-            readiness_stage: "collecting".to_string(),
-            rollup_buckets_collected: 0,
-            rollup_hours_collected: 0.0,
-            buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
-            hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            summary: String::new(),
-            notes: Vec::new(),
-        });
+    let mut prediction = build_candle_only_model_prediction(candles, product_id, target)?;
 
-    let evaluation = evaluate_walk_forward(&features, &labels, horizon_bars)
+    let evaluation = evaluate_walk_forward(&samples)
         .context("failed to evaluate history-augmented walk-forward metrics")?;
-    let latest_model = fit_logistic_model(&features, &labels)
+    let latest_model = fit_logistic_model(
+        &samples.iter().map(|item| item.features.clone()).collect::<Vec<_>>(),
+        &samples.iter().map(|item| item.label).collect::<Vec<_>>(),
+    )
         .context("failed to fit latest history-augmented model")?;
     let raw_probability_up = latest_model.predict_probability(&latest_features);
     let validation_edge = evaluation
@@ -1282,7 +1333,7 @@ fn build_history_augmented_model_prediction(
     prediction.probability_down = Some(probability_down);
     prediction.model_bias = model_bias;
     prediction.confidence = confidence;
-    prediction.training_samples = features.len();
+    prediction.training_samples = samples.len();
     prediction.test_samples = evaluation.test_samples;
     prediction.test_accuracy = evaluation.test_accuracy;
     prediction.baseline_accuracy = evaluation.baseline_accuracy;
@@ -1294,27 +1345,28 @@ fn build_history_augmented_model_prediction(
     prediction.matthews_corrcoef = evaluation.matthews_corrcoef;
     prediction.summary = if has_edge {
         format!(
-            "History-augmented baseline estimates a {:.1}% probability that {product_id} is higher in {} minutes.",
+            "History-augmented baseline estimates a {:.1}% probability that {product_id} is higher by {}.",
             probability_up * 100.0,
-            MODEL_HORIZON_MINUTES
+            target.label
         )
     } else {
         format!(
-            "History-augmented baseline does not currently beat a naive holdout baseline for {product_id}; no directional edge is exposed."
+            "History-augmented baseline does not currently beat a naive holdout baseline for {product_id} at {}.",
+            target.label
         )
     };
     prediction.notes = vec![
         format!(
-            "History-augmented baseline trained on {} locally persisted 5-minute rollup examples with a {}-minute horizon.",
-            features.len(),
-            MODEL_HORIZON_MINUTES
+            "History-augmented baseline trained on {} locally persisted 5-minute rollup examples for the {} horizon.",
+            samples.len(),
+            target.label
         ),
         format!(
             "Features combine local rollup microstructure, funding, basis, open interest, and market-context risk scores with Coinbase public 5-minute candle momentum/volatility."
         ),
         format!(
-            "Evaluation uses expanding walk-forward scoring on non-overlapping {}-minute holdout anchors.",
-            MODEL_HORIZON_MINUTES
+            "Evaluation uses expanding walk-forward scoring on non-overlapping {} holdout anchors.",
+            target.label
         ),
         format!(
             "Walk-forward holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
@@ -1351,31 +1403,36 @@ fn build_model_prediction(
     history: Option<&PersistedSymbolHistory>,
 ) -> Result<ModelPrediction> {
     let candles = fetch_public_product_candles(client, product_id)?;
-    if let Some(history) = history {
-        if let Some(prediction) = build_history_augmented_model_prediction(history, &candles, product_id)? {
-            let mut prediction = prediction;
-            apply_model_readiness(&mut prediction, Some(history));
-            return Ok(prediction);
+    let mut built = Vec::new();
+    for target in MODEL_TARGETS {
+        let mut prediction = if let Some(history) = history {
+            if let Some(prediction) =
+                build_history_augmented_model_prediction(history, &candles, product_id, target)?
+            {
+                prediction
+            } else {
+                build_candle_only_model_prediction(&candles, product_id, target)?
+            }
+        } else {
+            build_candle_only_model_prediction(&candles, product_id, target)?
+        };
+        apply_model_readiness(&mut prediction, history);
+        if prediction.status != "not_enough_data" && prediction.variant == "candle_only" {
+            let rollup_count = history.map(|item| item.rollups.len()).unwrap_or(0);
+            prediction.notes.push(format!(
+                "The richer history-augmented model is not active yet for {} because there are only {rollup_count} persisted local rollup buckets.",
+                target.label
+            ));
         }
+        built.push(prediction);
     }
-    let mut prediction = build_candle_only_model_prediction(&candles, product_id)?;
-    apply_model_readiness(&mut prediction, history);
-    if prediction.status != "not_enough_data" {
-        let rollup_count = history.map(|item| item.rollups.len()).unwrap_or(0);
-        prediction.notes.push(format!(
-            "The richer history-augmented model is not active yet because there are only {rollup_count} persisted local rollup buckets. Keep the dashboard running across more sessions to build that dataset."
-        ));
-        prediction.notes.push(format!(
-            "Activation threshold is {} rollup buckets (~{:.1}h). Early review starts around {} buckets (~{:.1}h), and serious trust starts around {} buckets (~{:.1}h).",
-            MODEL_ACTIVATION_ROLLUP_BUCKETS,
-            rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            MODEL_REVIEW_ROLLUP_BUCKETS,
-            rollup_buckets_to_hours(MODEL_REVIEW_ROLLUP_BUCKETS),
-            MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS,
-            rollup_buckets_to_hours(MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS),
-        ));
-    }
-    Ok(prediction)
+
+    let mut built_iter = built.into_iter();
+    let mut primary = built_iter
+        .next()
+        .context("no model targets were configured")?;
+    primary.additional_horizons = built_iter.collect();
+    Ok(primary)
 }
 
 fn decode_html_entities(input: &str) -> String {
@@ -1826,6 +1883,7 @@ fn load_prediction_for_symbol(
 
     let client = build_http_client()?;
     let prediction = build_model_prediction(&client, symbol, history).unwrap_or_else(|error| ModelPrediction {
+        horizon_label: "1h".to_string(),
         variant: "error".to_string(),
         status: "error".to_string(),
         horizon_minutes: MODEL_HORIZON_MINUTES,
@@ -1852,6 +1910,7 @@ fn load_prediction_for_symbol(
         hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
         summary: "The experimental model could not be computed for this symbol.".to_string(),
         notes: vec![format!("Prediction build failed: {error:#}")],
+        additional_horizons: Vec::new(),
     });
 
     if let Ok(mut guard) = cache.lock() {
@@ -3681,73 +3740,75 @@ const INDEX_HTML: &str = r#"<!doctype html>
         `;
       }
 
-      const notes = (prediction.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
-      const up = prediction.probability_up != null ? `${formatMaybe(prediction.probability_up * 100, 1)}%` : "unknown";
-      const down = prediction.probability_down != null ? `${formatMaybe(prediction.probability_down * 100, 1)}%` : "unknown";
-      const testAcc = prediction.test_accuracy != null ? `${formatMaybe(prediction.test_accuracy * 100, 1)}%` : "unknown";
-      const baseAcc = prediction.baseline_accuracy != null ? `${formatMaybe(prediction.baseline_accuracy * 100, 1)}%` : "unknown";
-      const edgeVsBaseline = prediction.edge_vs_baseline_pct_points != null ? `${formatSigned(prediction.edge_vs_baseline_pct_points, 1)} pts` : "unknown";
-      const brier = prediction.brier_score != null ? formatMaybe(prediction.brier_score, 3) : "unknown";
-      const holdoutUpRate = prediction.holdout_up_rate != null ? `${formatMaybe(prediction.holdout_up_rate * 100, 1)}%` : "unknown";
-      const oneClassHoldout = prediction.holdout_up_rate === 0 || prediction.holdout_up_rate === 1;
-      const balancedAcc = prediction.balanced_accuracy != null
-        ? `${formatMaybe(prediction.balanced_accuracy * 100, 1)}%`
-        : (oneClassHoldout ? "N/A (one-class)" : "unknown");
-      const mcc = prediction.matthews_corrcoef != null
-        ? formatMaybe(prediction.matthews_corrcoef, 3)
-        : (oneClassHoldout ? "N/A (one-class)" : "unknown");
-      const variantLabel = prediction.variant === "history_augmented"
-        ? "history-augmented"
-        : (prediction.variant === "candle_only" ? "candle-only" : (prediction.variant || "unknown"));
-      const collected = `${formatMaybe(prediction.rollup_hours_collected, 1)}h`;
-      const activationEta = prediction.buckets_until_activation > 0
-        ? `${formatMaybe(prediction.hours_until_activation, 1)}h left`
-        : "active";
-      const lowSampleWarning = Number(prediction.test_samples || 0) < 12
-        ? `<span class="badge warn">thin test window</span>`
-        : "";
-      const sampleNote = Number(prediction.test_samples || 0) < 12
-        ? "The current walk-forward holdout is still very small, so treat these metrics as preliminary."
-        : "";
+      function horizonSection(item, isPrimary) {
+        const up = item.probability_up != null ? `${formatMaybe(item.probability_up * 100, 1)}%` : "unknown";
+        const down = item.probability_down != null ? `${formatMaybe(item.probability_down * 100, 1)}%` : "unknown";
+        const testAcc = item.test_accuracy != null ? `${formatMaybe(item.test_accuracy * 100, 1)}%` : "unknown";
+        const baseAcc = item.baseline_accuracy != null ? `${formatMaybe(item.baseline_accuracy * 100, 1)}%` : "unknown";
+        const edgeVsBaseline = item.edge_vs_baseline_pct_points != null ? `${formatSigned(item.edge_vs_baseline_pct_points, 1)} pts` : "unknown";
+        const holdoutUpRate = item.holdout_up_rate != null ? `${formatMaybe(item.holdout_up_rate * 100, 1)}%` : "unknown";
+        const oneClassHoldout = item.holdout_up_rate === 0 || item.holdout_up_rate === 1;
+        const balancedAcc = item.balanced_accuracy != null
+          ? `${formatMaybe(item.balanced_accuracy * 100, 1)}%`
+          : (oneClassHoldout ? "N/A (one-class)" : "unknown");
+        const mcc = item.matthews_corrcoef != null
+          ? formatMaybe(item.matthews_corrcoef, 3)
+          : (oneClassHoldout ? "N/A (one-class)" : "unknown");
+        const brier = item.brier_score != null ? formatMaybe(item.brier_score, 3) : "unknown";
+        const lowSampleWarning = Number(item.test_samples || 0) < 12
+          ? `<span class="badge warn">thin test window</span>`
+          : "";
+        const sampleNote = Number(item.test_samples || 0) < 12
+          ? "The current walk-forward holdout is still very small, so treat these metrics as preliminary."
+          : "";
+
+        return `
+          <section class="${isPrimary ? "card" : "execution-panel"}">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">${isPrimary ? "Experimental Model" : `Horizon ${escapeHtml(item.horizon_label || "unknown")}`}</h2>
+                <div class="subtext">${escapeHtml(item.summary || "")}</div>
+              </div>
+              <div class="badges">
+                <span class="badge ${badgeClass(item.model_bias)}">${escapeHtml(item.model_bias || "unknown")}</span>
+                <span class="badge neutral">${escapeHtml(item.confidence || "low")} confidence</span>
+                ${isPrimary ? `<span class="badge ${badgeClass(item.readiness_stage || "neutral")}">${escapeHtml(item.readiness_stage || "collecting")}</span>` : ""}
+                ${lowSampleWarning}
+              </div>
+            </div>
+            <div class="stats-grid">
+              ${statCard("Horizon", item.horizon_label || "unknown")}
+              ${statCard("P Up", up, toneClass(item.probability_up != null ? item.probability_up - 0.5 : null))}
+              ${statCard("P Down", down, toneClass(item.probability_down != null ? item.probability_down - 0.5 : null))}
+              ${statCard("Train Samples", String(item.training_samples || 0))}
+              ${statCard("Test Samples", String(item.test_samples || 0))}
+              ${statCard("Holdout Up", holdoutUpRate)}
+              ${statCard("Majority Side", item.majority_label || "unknown")}
+              ${statCard("Test Accuracy", testAcc)}
+              ${statCard("Baseline", baseAcc)}
+              ${statCard("Balanced Acc", balancedAcc)}
+              ${statCard("MCC", mcc, toneClass(item.matthews_corrcoef))}
+              ${statCard("Edge vs Base", edgeVsBaseline, toneClass(item.edge_vs_baseline_pct_points))}
+              ${statCard("Brier", brier)}
+              ${statCard("Variant", item.variant === "history_augmented" ? "history-augmented" : (item.variant === "candle_only" ? "candle-only" : (item.variant || "unknown")))}
+              ${statCard("Status", item.status || "unknown")}
+              ${isPrimary ? statCard("History Collected", `${formatMaybe(item.rollup_hours_collected, 1)}h`) : ""}
+              ${isPrimary ? statCard("Augmented Model", item.buckets_until_activation > 0 ? `${formatMaybe(item.hours_until_activation, 1)}h left` : "active") : ""}
+            </div>
+            <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
+            <div class="signal-note">${escapeHtml(item.evaluation_method || "Evaluation method unknown.")}</div>
+            ${sampleNote ? `<div class="signal-note">${escapeHtml(sampleNote)}</div>` : ""}
+            ${isPrimary ? `<div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>` : ""}
+            <ul class="history-insights">${(item.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>
+          </section>
+        `;
+      }
+
+      const extraHorizons = (prediction.additional_horizons || []).map((item) => horizonSection(item, false)).join("");
 
       return `
-        <section class="card">
-          <div class="card-header">
-            <div>
-              <h2 class="card-title">Experimental Model</h2>
-              <div class="subtext">${escapeHtml(prediction.summary || "")}</div>
-            </div>
-            <div class="badges">
-              <span class="badge ${badgeClass(prediction.model_bias)}">${escapeHtml(prediction.model_bias || "unknown")}</span>
-              <span class="badge neutral">${escapeHtml(prediction.confidence || "low")} confidence</span>
-              <span class="badge ${badgeClass(prediction.readiness_stage || "neutral")}">${escapeHtml(prediction.readiness_stage || "collecting")}</span>
-              ${lowSampleWarning}
-            </div>
-          </div>
-          <div class="stats-grid">
-            ${statCard("P Up 1h", up, toneClass(prediction.probability_up != null ? prediction.probability_up - 0.5 : null))}
-            ${statCard("P Down 1h", down, toneClass(prediction.probability_down != null ? prediction.probability_down - 0.5 : null))}
-            ${statCard("Train Samples", String(prediction.training_samples || 0))}
-            ${statCard("Test Samples", String(prediction.test_samples || 0))}
-            ${statCard("Holdout Up", holdoutUpRate)}
-            ${statCard("Majority Side", prediction.majority_label || "unknown")}
-            ${statCard("Test Accuracy", testAcc)}
-            ${statCard("Baseline", baseAcc)}
-            ${statCard("Balanced Acc", balancedAcc)}
-            ${statCard("MCC", mcc, toneClass(prediction.matthews_corrcoef))}
-            ${statCard("Edge vs Base", edgeVsBaseline, toneClass(prediction.edge_vs_baseline_pct_points))}
-            ${statCard("Brier", brier)}
-            ${statCard("Variant", variantLabel)}
-            ${statCard("Status", prediction.status || "unknown")}
-            ${statCard("History Collected", collected)}
-            ${statCard("Augmented Model", activationEta)}
-          </div>
-          <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
-          <div class="signal-note">${escapeHtml(prediction.evaluation_method || "Evaluation method unknown.")}</div>
-          ${sampleNote ? `<div class="signal-note">${escapeHtml(sampleNote)}</div>` : ""}
-          <div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>
-          <ul class="history-insights">${notes}</ul>
-        </section>
+        ${horizonSection(prediction, true)}
+        ${extraHorizons}
       `;
     }
 

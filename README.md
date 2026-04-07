@@ -147,7 +147,7 @@ The dashboard also adds a conservative setup layer:
 - flat-mode re-entry watch cards for recently tracked symbols
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
-- an experimental 1-hour directional baseline model that trains locally on `5` minute data and shows `P(up in 1h)`, bias, confidence, walk-forward validation stats, model variant, class balance, and edge versus baseline
+- an experimental multi-horizon directional baseline model that trains locally on `5` minute data and shows `1h`, `4h`, and `next close` forecasts, with walk-forward validation stats, model variant, class balance, and edge versus baseline
 - explicit model-data readiness guidance showing collected local history, activation threshold, and longer-horizon trust thresholds
 
 This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
@@ -184,7 +184,10 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - `setup status` combines event risk, execution costs, book skew, and heuristic market bias into a conservative status such as `aligned`, `mixed`, or `avoid aggression`
 - `suggested max leverage` is a conservative cap derived from those same inputs and is meant as a risk-control prompt, not an instruction
 - `Experimental Model` is a separate overlay, not part of the execution gate
-- it runs on a `60` minute horizon with `5` minute bars
+- it now reports multiple horizons on `5` minute bars:
+- `1h`
+- `4h`
+- `next close` (next U.S. regular cash close)
 - when enough local persisted rollup history exists, it augments candle features with local microstructure, funding, basis, open-interest-notional, and market-context-risk features
 - otherwise it falls back to a candle-only model and says so explicitly
 - if the chronological holdout does not beat a naive baseline, the model neutralizes itself to `50/50` and reports `no_edge`
