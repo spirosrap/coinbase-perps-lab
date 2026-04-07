@@ -147,7 +147,7 @@ The dashboard also adds a conservative setup layer:
 - flat-mode re-entry watch cards for recently tracked symbols
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
-- an experimental 1-hour directional baseline model that trains locally on `5` minute data and shows `P(up in 1h)`, bias, confidence, holdout validation stats, model variant, and edge versus baseline
+- an experimental 1-hour directional baseline model that trains locally on `5` minute data and shows `P(up in 1h)`, bias, confidence, walk-forward validation stats, model variant, class balance, and edge versus baseline
 - explicit model-data readiness guidance showing collected local history, activation threshold, and longer-horizon trust thresholds
 
 This setup layer is intentionally conservative and non-binding. It is context, not financial advice.
@@ -190,6 +190,11 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - if the chronological holdout does not beat a naive baseline, the model neutralizes itself to `50/50` and reports `no_edge`
 - `Variant` shows whether you are seeing the `history_augmented` or `candle_only` path
 - `Edge vs Base` shows the holdout accuracy delta versus the naive majority-class baseline, in percentage points
+- `Evaluation Method` is now an expanding walk-forward evaluation on non-overlapping `60` minute holdout anchors
+- `Holdout Up` shows the fraction of holdout examples labeled up
+- `Majority Side` shows which side the naive baseline would always predict
+- `Balanced Acc` is the mean of up-side recall and down-side recall when both classes exist in the holdout set
+- `MCC` is the Matthews correlation coefficient, which is more informative than plain accuracy under class imbalance
 - `History Collected` shows how much persisted 5-minute rollup history the dashboard has for that symbol
 - `Augmented Model` shows whether the richer model is active yet or how much local history is still needed
 - readiness thresholds are:

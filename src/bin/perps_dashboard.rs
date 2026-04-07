@@ -387,6 +387,7 @@ struct ModelPrediction {
     status: String,
     horizon_minutes: u32,
     granularity: String,
+    evaluation_method: String,
     probability_up: Option<f64>,
     probability_down: Option<f64>,
     model_bias: String,
@@ -397,6 +398,10 @@ struct ModelPrediction {
     baseline_accuracy: Option<f64>,
     edge_vs_baseline_pct_points: Option<f64>,
     brier_score: Option<f64>,
+    holdout_up_rate: Option<f64>,
+    majority_label: Option<String>,
+    balanced_accuracy: Option<f64>,
+    matthews_corrcoef: Option<f64>,
     readiness_stage: String,
     rollup_buckets_collected: usize,
     rollup_hours_collected: f64,
@@ -774,6 +779,203 @@ fn classify_model_bias(probability_up: f64, confidence: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LogisticModel {
+    weights: Vec<f64>,
+    bias: f64,
+    means: Vec<f64>,
+    stds: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelEvaluation {
+    evaluation_method: String,
+    test_samples: usize,
+    test_accuracy: Option<f64>,
+    baseline_accuracy: Option<f64>,
+    edge_vs_baseline_pct_points: Option<f64>,
+    brier_score: Option<f64>,
+    holdout_up_rate: Option<f64>,
+    majority_label: Option<String>,
+    balanced_accuracy: Option<f64>,
+    matthews_corrcoef: Option<f64>,
+}
+
+impl LogisticModel {
+    fn normalize_row(&self, row: &[f64]) -> Vec<f64> {
+        row.iter()
+            .enumerate()
+            .map(|(index, value)| (value - self.means[index]) / self.stds[index])
+            .collect()
+    }
+
+    fn predict_probability(&self, row: &[f64]) -> f64 {
+        let normalized = self.normalize_row(row);
+        sigmoid(dot(&self.weights, &normalized) + self.bias)
+    }
+}
+
+fn model_split_index(sample_count: usize) -> Option<usize> {
+    if sample_count < 120 {
+        return None;
+    }
+    Some(
+        (((sample_count as f64) * 0.8).floor() as usize)
+            .clamp(80, sample_count.saturating_sub(24)),
+    )
+}
+
+fn fit_logistic_model(features: &[Vec<f64>], labels: &[f64]) -> Option<LogisticModel> {
+    if features.is_empty() || features.len() != labels.len() {
+        return None;
+    }
+    let feature_count = features.first()?.len();
+    if feature_count == 0 {
+        return None;
+    }
+
+    let mut means = vec![0.0; feature_count];
+    let mut stds = vec![1.0; feature_count];
+    for feature_index in 0..feature_count {
+        let column = features
+            .iter()
+            .map(|row| row[feature_index])
+            .collect::<Vec<_>>();
+        means[feature_index] = rolling_mean(&column).unwrap_or(0.0);
+        stds[feature_index] = rolling_std(&column)
+            .filter(|value| *value > 1e-9)
+            .unwrap_or(1.0);
+    }
+
+    let normalized_features = features
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(index, value)| (value - means[index]) / stds[index])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut weights = vec![0.0; feature_count];
+    let mut bias = 0.0;
+    let learning_rate = 0.12;
+    let l2 = 0.0005;
+    for _ in 0..700 {
+        let mut grad_w = vec![0.0; feature_count];
+        let mut grad_b = 0.0;
+        for (row, label) in normalized_features.iter().zip(labels.iter()) {
+            let prediction = sigmoid(dot(&weights, row) + bias);
+            let error = prediction - label;
+            for (index, value) in row.iter().enumerate() {
+                grad_w[index] += error * value;
+            }
+            grad_b += error;
+        }
+        let n = normalized_features.len() as f64;
+        for index in 0..feature_count {
+            grad_w[index] = grad_w[index] / n + l2 * weights[index];
+            weights[index] -= learning_rate * grad_w[index];
+        }
+        bias -= learning_rate * (grad_b / n);
+    }
+
+    Some(LogisticModel {
+        weights,
+        bias,
+        means,
+        stds,
+    })
+}
+
+fn evaluate_walk_forward(
+    features: &[Vec<f64>],
+    labels: &[f64],
+    horizon_step: usize,
+) -> Option<ModelEvaluation> {
+    let split_index = model_split_index(features.len())?;
+    let mut predictions = Vec::new();
+    let mut holdout_labels = Vec::new();
+    let mut test_index = split_index;
+    let step = horizon_step.max(1);
+
+    while test_index < features.len() {
+        let model = fit_logistic_model(&features[..test_index], &labels[..test_index])?;
+        predictions.push(model.predict_probability(&features[test_index]));
+        holdout_labels.push(labels[test_index]);
+        test_index = test_index.saturating_add(step);
+    }
+
+    if predictions.is_empty() || predictions.len() != holdout_labels.len() {
+        return None;
+    }
+
+    let mut correct = 0usize;
+    let mut positives = 0usize;
+    let mut squared_error = 0.0;
+    let mut tp = 0usize;
+    let mut tn = 0usize;
+    let mut fp = 0usize;
+    let mut fn_ = 0usize;
+
+    for (probability, label) in predictions.iter().zip(holdout_labels.iter()) {
+        let predicted_up = *probability >= 0.5;
+        let actual_up = *label >= 0.5;
+        if predicted_up == actual_up {
+            correct += 1;
+        }
+        if actual_up {
+            positives += 1;
+        }
+        squared_error += (probability - label).powi(2);
+        match (predicted_up, actual_up) {
+            (true, true) => tp += 1,
+            (false, false) => tn += 1,
+            (true, false) => fp += 1,
+            (false, true) => fn_ += 1,
+        }
+    }
+
+    let test_samples = holdout_labels.len();
+    let positives_f = positives as f64;
+    let negatives = test_samples.saturating_sub(positives);
+    let negatives_f = negatives as f64;
+    let test_accuracy = Some(correct as f64 / test_samples as f64);
+    let baseline_accuracy =
+        Some((positives.max(negatives) as f64) / test_samples as f64);
+    let holdout_up_rate = Some(positives as f64 / test_samples as f64);
+    let majority_label = if positives >= negatives {
+        Some("up".to_string())
+    } else {
+        Some("down".to_string())
+    };
+    let brier_score = Some(squared_error / test_samples as f64);
+    let tpr = (positives > 0).then_some(tp as f64 / positives_f);
+    let tnr = (negatives > 0).then_some(tn as f64 / negatives_f);
+    let balanced_accuracy = tpr.zip(tnr).map(|(up, down)| (up + down) / 2.0);
+    let mcc_denominator =
+        ((tp + fp) as f64 * (tp + fn_) as f64 * (tn + fp) as f64 * (tn + fn_) as f64).sqrt();
+    let matthews_corrcoef = (mcc_denominator > 0.0).then_some(
+        ((tp * tn) as f64 - (fp * fn_) as f64) / mcc_denominator,
+    );
+
+    Some(ModelEvaluation {
+        evaluation_method:
+            "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
+        test_samples,
+        test_accuracy,
+        baseline_accuracy,
+        edge_vs_baseline_pct_points: test_accuracy
+            .zip(baseline_accuracy)
+            .map(|(test, base)| (test - base) * 100.0),
+        brier_score,
+        holdout_up_rate,
+        majority_label,
+        balanced_accuracy,
+        matthews_corrcoef,
+    })
+}
+
 fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -> Result<ModelPrediction> {
     let horizon_bars = (MODEL_HORIZON_MINUTES / MODEL_GRANULARITY_MINUTES) as usize;
     if candles.len() < 120 || horizon_bars == 0 {
@@ -782,6 +984,8 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
             status: "not_enough_data".to_string(),
             horizon_minutes: MODEL_HORIZON_MINUTES,
             granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            evaluation_method:
+                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
             probability_up: None,
             probability_down: None,
             model_bias: "unknown".to_string(),
@@ -792,13 +996,21 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
             baseline_accuracy: None,
             edge_vs_baseline_pct_points: None,
             brier_score: None,
+            holdout_up_rate: None,
+            majority_label: None,
+            balanced_accuracy: None,
+            matthews_corrcoef: None,
             readiness_stage: "collecting".to_string(),
             rollup_buckets_collected: 0,
             rollup_hours_collected: 0.0,
             buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
             hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            summary: "Not enough candle history is available to build the experimental baseline.".to_string(),
-            notes: vec!["The fallback candle-only model needs several days of 5-minute candles to train and evaluate.".to_string()],
+            summary: "Not enough candle history is available to build the experimental baseline."
+                .to_string(),
+            notes: vec![
+                "The fallback candle-only model needs several days of 5-minute candles to train and evaluate."
+                    .to_string(),
+            ],
         });
     }
 
@@ -808,7 +1020,10 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
         let Some(vector) = candle_feature_vector(candles, index) else {
             continue;
         };
-        let future_close = candles.get(index + horizon_bars).map(|item| item.close).unwrap_or(0.0);
+        let future_close = candles
+            .get(index + horizon_bars)
+            .map(|item| item.close)
+            .unwrap_or(0.0);
         let current_close = candles.get(index).map(|item| item.close).unwrap_or(0.0);
         if current_close <= 0.0 || future_close <= 0.0 {
             continue;
@@ -823,6 +1038,8 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
             status: "not_enough_data".to_string(),
             horizon_minutes: MODEL_HORIZON_MINUTES,
             granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            evaluation_method:
+                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
             probability_up: None,
             probability_down: None,
             model_bias: "unknown".to_string(),
@@ -833,94 +1050,34 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
             baseline_accuracy: None,
             edge_vs_baseline_pct_points: None,
             brier_score: None,
+            holdout_up_rate: None,
+            majority_label: None,
+            balanced_accuracy: None,
+            matthews_corrcoef: None,
             readiness_stage: "collecting".to_string(),
             rollup_buckets_collected: 0,
             rollup_hours_collected: 0.0,
             buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
             hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-            summary: "Not enough feature/label examples are available yet for the experimental model.".to_string(),
-            notes: vec!["The fallback candle-only model discards a longer warm-up window to compute multi-horizon momentum and volatility features.".to_string()],
+            summary: "Not enough feature/label examples are available yet for the experimental model."
+                .to_string(),
+            notes: vec![
+                "The fallback candle-only model discards a longer warm-up window to compute multi-horizon momentum and volatility features."
+                    .to_string(),
+            ],
         });
     }
 
-    let split_index = ((features.len() as f64) * 0.8).floor() as usize;
-    let split_index = split_index.clamp(80, features.len().saturating_sub(24));
-    let train_x = &features[..split_index];
-    let train_y = &labels[..split_index];
-    let test_x = &features[split_index..];
-    let test_y = &labels[split_index..];
-    let feature_count = train_x.first().map(|row| row.len()).unwrap_or(0);
-
-    let mut means = vec![0.0; feature_count];
-    let mut stds = vec![1.0; feature_count];
-    for feature_index in 0..feature_count {
-        let column = train_x
-            .iter()
-            .map(|row| row[feature_index])
-            .collect::<Vec<_>>();
-        means[feature_index] = rolling_mean(&column).unwrap_or(0.0);
-        stds[feature_index] = rolling_std(&column).filter(|value| *value > 1e-9).unwrap_or(1.0);
-    }
-
-    let normalize = |row: &[f64]| -> Vec<f64> {
-        row.iter()
-            .enumerate()
-            .map(|(index, value)| (value - means[index]) / stds[index])
-            .collect()
-    };
-
-    let train_x = train_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
-    let test_x = test_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
-
-    let mut weights = vec![0.0; feature_count];
-    let mut bias = 0.0;
-    let learning_rate = 0.12;
-    let l2 = 0.0005;
-    for _ in 0..700 {
-        let mut grad_w = vec![0.0; feature_count];
-        let mut grad_b = 0.0;
-        for (row, label) in train_x.iter().zip(train_y.iter()) {
-            let prediction = sigmoid(dot(&weights, row) + bias);
-            let error = prediction - label;
-            for (index, value) in row.iter().enumerate() {
-                grad_w[index] += error * value;
-            }
-            grad_b += error;
-        }
-        let n = train_x.len() as f64;
-        for index in 0..feature_count {
-            grad_w[index] = grad_w[index] / n + l2 * weights[index];
-            weights[index] -= learning_rate * grad_w[index];
-        }
-        bias -= learning_rate * (grad_b / n);
-    }
-
-    let mut correct = 0usize;
-    let mut positives = 0usize;
-    let mut squared_error = 0.0;
-    for (row, label) in test_x.iter().zip(test_y.iter()) {
-        let probability = sigmoid(dot(&weights, row) + bias);
-        let predicted = (probability >= 0.5) as u8 as f64;
-        if (predicted - label).abs() < f64::EPSILON {
-            correct += 1;
-        }
-        if *label >= 0.5 {
-            positives += 1;
-        }
-        squared_error += (probability - label).powi(2);
-    }
-    let test_accuracy = (!test_y.is_empty()).then_some(correct as f64 / test_y.len() as f64);
-    let baseline_accuracy = (!test_y.is_empty()).then_some(
-        (positives.max(test_y.len().saturating_sub(positives)) as f64) / test_y.len() as f64,
-    );
-    let brier_score = (!test_y.is_empty()).then_some(squared_error / test_y.len() as f64);
-
+    let evaluation = evaluate_walk_forward(&features, &labels, horizon_bars)
+        .context("failed to evaluate candle-only walk-forward metrics")?;
     let latest_features = candle_feature_vector(candles, candles.len() - 1)
         .context("failed to build latest candle-only feature vector")?;
-    let latest_features = normalize(&latest_features);
-    let raw_probability_up = sigmoid(dot(&weights, &latest_features) + bias);
-    let validation_edge = test_accuracy
-        .zip(baseline_accuracy)
+    let latest_model =
+        fit_logistic_model(&features, &labels).context("failed to fit latest candle-only model")?;
+    let raw_probability_up = latest_model.predict_probability(&latest_features);
+    let validation_edge = evaluation
+        .test_accuracy
+        .zip(evaluation.baseline_accuracy)
         .map(|(test, base)| test - base)
         .unwrap_or(0.0);
     let has_edge = validation_edge > 0.0;
@@ -930,7 +1087,11 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
         0.5
     };
     let probability_down = 1.0 - probability_up;
-    let confidence = classify_model_confidence(probability_up, test_accuracy, baseline_accuracy);
+    let confidence = classify_model_confidence(
+        probability_up,
+        evaluation.test_accuracy,
+        evaluation.baseline_accuracy,
+    );
     let model_bias = classify_model_bias(probability_up, &confidence);
     let status = if has_edge { "available" } else { "no_edge" }.to_string();
 
@@ -940,11 +1101,24 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
         MODEL_GRANULARITY_MINUTES,
         MODEL_HORIZON_MINUTES
     )];
-    if let (Some(test), Some(base)) = (test_accuracy, baseline_accuracy) {
+    notes.push(format!(
+        "Evaluation uses expanding walk-forward scoring on non-overlapping {}-minute holdout anchors.",
+        MODEL_HORIZON_MINUTES
+    ));
+    if let (Some(test), Some(base)) = (evaluation.test_accuracy, evaluation.baseline_accuracy) {
         notes.push(format!(
-            "Chronological holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
+            "Walk-forward holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
             test * 100.0,
             base * 100.0
+        ));
+    }
+    if let (Some(up_rate), Some(majority_label)) =
+        (evaluation.holdout_up_rate, evaluation.majority_label.as_deref())
+    {
+        notes.push(format!(
+            "The non-overlapping holdout slice is {:.1}% up labels, so the naive baseline mostly wins by always predicting {}.",
+            up_rate * 100.0,
+            majority_label
         ));
     }
     if has_edge {
@@ -968,16 +1142,21 @@ fn build_candle_only_model_prediction(candles: &[CandleBar], product_id: &str) -
         status,
         horizon_minutes: MODEL_HORIZON_MINUTES,
         granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+        evaluation_method: evaluation.evaluation_method,
         probability_up: Some(probability_up),
         probability_down: Some(probability_down),
-        model_bias: model_bias.clone(),
+        model_bias,
         confidence,
-        training_samples: train_x.len(),
-        test_samples: test_x.len(),
-        test_accuracy,
-        baseline_accuracy,
-        edge_vs_baseline_pct_points: test_accuracy.zip(baseline_accuracy).map(|(test, base)| (test - base) * 100.0),
-        brier_score,
+        training_samples: features.len(),
+        test_samples: evaluation.test_samples,
+        test_accuracy: evaluation.test_accuracy,
+        baseline_accuracy: evaluation.baseline_accuracy,
+        edge_vs_baseline_pct_points: evaluation.edge_vs_baseline_pct_points,
+        brier_score: evaluation.brier_score,
+        holdout_up_rate: evaluation.holdout_up_rate,
+        majority_label: evaluation.majority_label,
+        balanced_accuracy: evaluation.balanced_accuracy,
+        matthews_corrcoef: evaluation.matthews_corrcoef,
         readiness_stage: "collecting".to_string(),
         rollup_buckets_collected: 0,
         rollup_hours_collected: 0.0,
@@ -1009,7 +1188,9 @@ fn build_history_augmented_model_prediction(
     let mut latest_features = None;
 
     for rollup_index in 0..history.rollups.len() {
-        let Some((vector, candle_index)) = rollup_feature_vector(history, candles, rollup_index) else {
+        let Some((vector, candle_index)) =
+            rollup_feature_vector(history, candles, rollup_index)
+        else {
             continue;
         };
         if candle_index + horizon_bars >= candles.len() {
@@ -1044,6 +1225,8 @@ fn build_history_augmented_model_prediction(
             status: "not_enough_data".to_string(),
             horizon_minutes: MODEL_HORIZON_MINUTES,
             granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+            evaluation_method:
+                "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
             probability_up: None,
             probability_down: None,
             model_bias: "unknown".to_string(),
@@ -1054,6 +1237,10 @@ fn build_history_augmented_model_prediction(
             baseline_accuracy: None,
             edge_vs_baseline_pct_points: None,
             brier_score: None,
+            holdout_up_rate: None,
+            majority_label: None,
+            balanced_accuracy: None,
+            matthews_corrcoef: None,
             readiness_stage: "collecting".to_string(),
             rollup_buckets_collected: 0,
             rollup_hours_collected: 0.0,
@@ -1063,81 +1250,14 @@ fn build_history_augmented_model_prediction(
             notes: Vec::new(),
         });
 
-    let split_index = ((features.len() as f64) * 0.8).floor() as usize;
-    let split_index = split_index.clamp(80, features.len().saturating_sub(24));
-    let train_x = &features[..split_index];
-    let train_y = &labels[..split_index];
-    let test_x = &features[split_index..];
-    let test_y = &labels[split_index..];
-    let feature_count = train_x.first().map(|row| row.len()).unwrap_or(0);
-
-    let mut means = vec![0.0; feature_count];
-    let mut stds = vec![1.0; feature_count];
-    for feature_index in 0..feature_count {
-        let column = train_x
-            .iter()
-            .map(|row| row[feature_index])
-            .collect::<Vec<_>>();
-        means[feature_index] = rolling_mean(&column).unwrap_or(0.0);
-        stds[feature_index] = rolling_std(&column).filter(|value| *value > 1e-9).unwrap_or(1.0);
-    }
-
-    let normalize = |row: &[f64]| -> Vec<f64> {
-        row.iter()
-            .enumerate()
-            .map(|(index, value)| (value - means[index]) / stds[index])
-            .collect()
-    };
-
-    let train_x = train_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
-    let test_x = test_x.iter().map(|row| normalize(row)).collect::<Vec<_>>();
-    let latest_features = normalize(&latest_features);
-
-    let mut weights = vec![0.0; feature_count];
-    let mut bias = 0.0;
-    let learning_rate = 0.12;
-    let l2 = 0.0005;
-    for _ in 0..700 {
-        let mut grad_w = vec![0.0; feature_count];
-        let mut grad_b = 0.0;
-        for (row, label) in train_x.iter().zip(train_y.iter()) {
-            let probability = sigmoid(dot(&weights, row) + bias);
-            let error = probability - label;
-            for (index, value) in row.iter().enumerate() {
-                grad_w[index] += error * value;
-            }
-            grad_b += error;
-        }
-        let n = train_x.len() as f64;
-        for index in 0..feature_count {
-            grad_w[index] = grad_w[index] / n + l2 * weights[index];
-            weights[index] -= learning_rate * grad_w[index];
-        }
-        bias -= learning_rate * (grad_b / n);
-    }
-
-    let mut correct = 0usize;
-    let mut positives = 0usize;
-    let mut squared_error = 0.0;
-    for (row, label) in test_x.iter().zip(test_y.iter()) {
-        let probability = sigmoid(dot(&weights, row) + bias);
-        let predicted = (probability >= 0.5) as u8 as f64;
-        if (predicted - label).abs() < f64::EPSILON {
-            correct += 1;
-        }
-        if *label >= 0.5 {
-            positives += 1;
-        }
-        squared_error += (probability - label).powi(2);
-    }
-    let test_accuracy = (!test_y.is_empty()).then_some(correct as f64 / test_y.len() as f64);
-    let baseline_accuracy = (!test_y.is_empty()).then_some(
-        (positives.max(test_y.len().saturating_sub(positives)) as f64) / test_y.len() as f64,
-    );
-    let brier_score = (!test_y.is_empty()).then_some(squared_error / test_y.len() as f64);
-    let raw_probability_up = sigmoid(dot(&weights, &latest_features) + bias);
-    let validation_edge = test_accuracy
-        .zip(baseline_accuracy)
+    let evaluation = evaluate_walk_forward(&features, &labels, horizon_bars)
+        .context("failed to evaluate history-augmented walk-forward metrics")?;
+    let latest_model = fit_logistic_model(&features, &labels)
+        .context("failed to fit latest history-augmented model")?;
+    let raw_probability_up = latest_model.predict_probability(&latest_features);
+    let validation_edge = evaluation
+        .test_accuracy
+        .zip(evaluation.baseline_accuracy)
         .map(|(test, base)| test - base)
         .unwrap_or(0.0);
     let has_edge = validation_edge > 0.0;
@@ -1147,23 +1267,31 @@ fn build_history_augmented_model_prediction(
         0.5
     };
     let probability_down = 1.0 - probability_up;
-    let confidence = classify_model_confidence(probability_up, test_accuracy, baseline_accuracy);
+    let confidence = classify_model_confidence(
+        probability_up,
+        evaluation.test_accuracy,
+        evaluation.baseline_accuracy,
+    );
     let model_bias = classify_model_bias(probability_up, &confidence);
     let status = if has_edge { "available" } else { "no_edge" }.to_string();
 
     prediction.status = status;
     prediction.variant = "history_augmented".to_string();
+    prediction.evaluation_method = evaluation.evaluation_method;
     prediction.probability_up = Some(probability_up);
     prediction.probability_down = Some(probability_down);
     prediction.model_bias = model_bias;
     prediction.confidence = confidence;
-    prediction.training_samples = train_x.len();
-    prediction.test_samples = test_x.len();
-    prediction.test_accuracy = test_accuracy;
-    prediction.baseline_accuracy = baseline_accuracy;
-    prediction.edge_vs_baseline_pct_points =
-        test_accuracy.zip(baseline_accuracy).map(|(test, base)| (test - base) * 100.0);
-    prediction.brier_score = brier_score;
+    prediction.training_samples = features.len();
+    prediction.test_samples = evaluation.test_samples;
+    prediction.test_accuracy = evaluation.test_accuracy;
+    prediction.baseline_accuracy = evaluation.baseline_accuracy;
+    prediction.edge_vs_baseline_pct_points = evaluation.edge_vs_baseline_pct_points;
+    prediction.brier_score = evaluation.brier_score;
+    prediction.holdout_up_rate = evaluation.holdout_up_rate;
+    prediction.majority_label = evaluation.majority_label.clone();
+    prediction.balanced_accuracy = evaluation.balanced_accuracy;
+    prediction.matthews_corrcoef = evaluation.matthews_corrcoef;
     prediction.summary = if has_edge {
         format!(
             "History-augmented baseline estimates a {:.1}% probability that {product_id} is higher in {} minutes.",
@@ -1185,9 +1313,21 @@ fn build_history_augmented_model_prediction(
             "Features combine local rollup microstructure, funding, basis, open interest, and market-context risk scores with Coinbase public 5-minute candle momentum/volatility."
         ),
         format!(
-            "Chronological holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
-            test_accuracy.unwrap_or(0.0) * 100.0,
-            baseline_accuracy.unwrap_or(0.0) * 100.0
+            "Evaluation uses expanding walk-forward scoring on non-overlapping {}-minute holdout anchors.",
+            MODEL_HORIZON_MINUTES
+        ),
+        format!(
+            "Walk-forward holdout accuracy is {:.1}% versus a {:.1}% majority-class baseline.",
+            evaluation.test_accuracy.unwrap_or(0.0) * 100.0,
+            evaluation.baseline_accuracy.unwrap_or(0.0) * 100.0
+        ),
+        format!(
+            "The non-overlapping holdout slice is {:.1}% up labels, so the naive baseline mostly wins by always predicting {}.",
+            evaluation.holdout_up_rate.unwrap_or(0.0) * 100.0,
+            evaluation
+                .majority_label
+                .as_deref()
+                .unwrap_or("the majority side")
         ),
         if has_edge {
             format!(
@@ -1690,6 +1830,7 @@ fn load_prediction_for_symbol(
         status: "error".to_string(),
         horizon_minutes: MODEL_HORIZON_MINUTES,
         granularity: MODEL_CANDLE_GRANULARITY.to_string(),
+        evaluation_method: "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
         probability_up: None,
         probability_down: None,
         model_bias: "unknown".to_string(),
@@ -1700,6 +1841,10 @@ fn load_prediction_for_symbol(
         baseline_accuracy: None,
         edge_vs_baseline_pct_points: None,
         brier_score: None,
+        holdout_up_rate: None,
+        majority_label: None,
+        balanced_accuracy: None,
+        matthews_corrcoef: None,
         readiness_stage: "collecting".to_string(),
         rollup_buckets_collected: 0,
         rollup_hours_collected: 0.0,
@@ -3543,6 +3688,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const baseAcc = prediction.baseline_accuracy != null ? `${formatMaybe(prediction.baseline_accuracy * 100, 1)}%` : "unknown";
       const edgeVsBaseline = prediction.edge_vs_baseline_pct_points != null ? `${formatSigned(prediction.edge_vs_baseline_pct_points, 1)} pts` : "unknown";
       const brier = prediction.brier_score != null ? formatMaybe(prediction.brier_score, 3) : "unknown";
+      const holdoutUpRate = prediction.holdout_up_rate != null ? `${formatMaybe(prediction.holdout_up_rate * 100, 1)}%` : "unknown";
+      const balancedAcc = prediction.balanced_accuracy != null ? `${formatMaybe(prediction.balanced_accuracy * 100, 1)}%` : "unknown";
+      const mcc = prediction.matthews_corrcoef != null ? formatMaybe(prediction.matthews_corrcoef, 3) : "unknown";
       const collected = `${formatMaybe(prediction.rollup_hours_collected, 1)}h`;
       const activationEta = prediction.buckets_until_activation > 0
         ? `${formatMaybe(prediction.hours_until_activation, 1)}h left`
@@ -3566,8 +3714,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("P Down 1h", down, toneClass(prediction.probability_down != null ? prediction.probability_down - 0.5 : null))}
             ${statCard("Train Samples", String(prediction.training_samples || 0))}
             ${statCard("Test Samples", String(prediction.test_samples || 0))}
+            ${statCard("Holdout Up", holdoutUpRate)}
+            ${statCard("Majority Side", prediction.majority_label || "unknown")}
             ${statCard("Test Accuracy", testAcc)}
             ${statCard("Baseline", baseAcc)}
+            ${statCard("Balanced Acc", balancedAcc)}
+            ${statCard("MCC", mcc, toneClass(prediction.matthews_corrcoef))}
             ${statCard("Edge vs Base", edgeVsBaseline, toneClass(prediction.edge_vs_baseline_pct_points))}
             ${statCard("Brier", brier)}
             ${statCard("Variant", prediction.variant || "unknown")}
@@ -3576,6 +3728,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Augmented Model", activationEta)}
           </div>
           <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
+          <div class="signal-note">${escapeHtml(prediction.evaluation_method || "Evaluation method unknown.")}</div>
           <div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>
           <ul class="history-insights">${notes}</ul>
         </section>
