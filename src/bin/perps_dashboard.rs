@@ -3689,12 +3689,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const edgeVsBaseline = prediction.edge_vs_baseline_pct_points != null ? `${formatSigned(prediction.edge_vs_baseline_pct_points, 1)} pts` : "unknown";
       const brier = prediction.brier_score != null ? formatMaybe(prediction.brier_score, 3) : "unknown";
       const holdoutUpRate = prediction.holdout_up_rate != null ? `${formatMaybe(prediction.holdout_up_rate * 100, 1)}%` : "unknown";
-      const balancedAcc = prediction.balanced_accuracy != null ? `${formatMaybe(prediction.balanced_accuracy * 100, 1)}%` : "unknown";
-      const mcc = prediction.matthews_corrcoef != null ? formatMaybe(prediction.matthews_corrcoef, 3) : "unknown";
+      const oneClassHoldout = prediction.holdout_up_rate === 0 || prediction.holdout_up_rate === 1;
+      const balancedAcc = prediction.balanced_accuracy != null
+        ? `${formatMaybe(prediction.balanced_accuracy * 100, 1)}%`
+        : (oneClassHoldout ? "N/A (one-class)" : "unknown");
+      const mcc = prediction.matthews_corrcoef != null
+        ? formatMaybe(prediction.matthews_corrcoef, 3)
+        : (oneClassHoldout ? "N/A (one-class)" : "unknown");
+      const variantLabel = prediction.variant === "history_augmented"
+        ? "history-augmented"
+        : (prediction.variant === "candle_only" ? "candle-only" : (prediction.variant || "unknown"));
       const collected = `${formatMaybe(prediction.rollup_hours_collected, 1)}h`;
       const activationEta = prediction.buckets_until_activation > 0
         ? `${formatMaybe(prediction.hours_until_activation, 1)}h left`
         : "active";
+      const lowSampleWarning = Number(prediction.test_samples || 0) < 12
+        ? `<span class="badge warn">thin test window</span>`
+        : "";
+      const sampleNote = Number(prediction.test_samples || 0) < 12
+        ? "The current walk-forward holdout is still very small, so treat these metrics as preliminary."
+        : "";
 
       return `
         <section class="card">
@@ -3707,6 +3721,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <span class="badge ${badgeClass(prediction.model_bias)}">${escapeHtml(prediction.model_bias || "unknown")}</span>
               <span class="badge neutral">${escapeHtml(prediction.confidence || "low")} confidence</span>
               <span class="badge ${badgeClass(prediction.readiness_stage || "neutral")}">${escapeHtml(prediction.readiness_stage || "collecting")}</span>
+              ${lowSampleWarning}
             </div>
           </div>
           <div class="stats-grid">
@@ -3722,13 +3737,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("MCC", mcc, toneClass(prediction.matthews_corrcoef))}
             ${statCard("Edge vs Base", edgeVsBaseline, toneClass(prediction.edge_vs_baseline_pct_points))}
             ${statCard("Brier", brier)}
-            ${statCard("Variant", prediction.variant || "unknown")}
+            ${statCard("Variant", variantLabel)}
             ${statCard("Status", prediction.status || "unknown")}
             ${statCard("History Collected", collected)}
             ${statCard("Augmented Model", activationEta)}
           </div>
           <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
           <div class="signal-note">${escapeHtml(prediction.evaluation_method || "Evaluation method unknown.")}</div>
+          ${sampleNote ? `<div class="signal-note">${escapeHtml(sampleNote)}</div>` : ""}
           <div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>
           <ul class="history-insights">${notes}</ul>
         </section>
