@@ -115,9 +115,16 @@ The Rust output now includes additional derived context per position:
 - open interest and max leverage
 - heuristic market bias and position outlook labels
 - simple scenario projections for `+1%`, `+3%`, `-1%`, and `-3%` moves from the current mark
-- an experimental 1-hour directional model in the dashboard, which prefers a history-augmented local feature set when enough persisted rollups exist and otherwise falls back to Coinbase public candles only
+- an experimental multi-horizon directional model in the dashboard for `1h`, `4h`, and `next close`
+- the model now persists a local Coinbase candle archive inside the dashboard history file and evaluates on that archive instead of only the short live fetch window
 
 The dashboard shows the same snapshot in a browser-friendly layout and polls the local backend for refreshes.
+
+The default history file now persists:
+
+- recent raw dashboard samples
+- 5-minute rollups
+- a per-symbol local candle archive used by the experimental model
 
 If you leave the dashboard running, it also builds a rolling in-memory microstructure history per symbol so you can compare:
 

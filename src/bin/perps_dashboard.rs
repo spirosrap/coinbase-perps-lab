@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_HISTORY_POINTS: usize = 240;
 const ROLLUP_BUCKET_MS: u64 = 5 * 60 * 1000;
 const MAX_ROLLUP_BUCKETS: usize = 14 * 24 * 12;
+const MAX_PERSISTED_CANDLES: usize = 5_000;
 const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 const MARKET_CONTEXT_TTL_MS: u64 = 30 * 60 * 1000;
@@ -35,6 +36,9 @@ const MODEL_GRANULARITY_MINUTES: u32 = 5;
 const MODEL_HORIZON_MINUTES: u32 = 60;
 const MODEL_CANDLE_LIMIT: usize = 350;
 const MODEL_CANDLE_WINDOWS: usize = 6;
+const MODEL_CANDLE_RECENT_WINDOWS: usize = 2;
+const MODEL_CANDLE_ARCHIVE_TARGET_BARS: usize = 2_500;
+const MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS: usize = 24;
 const MODEL_ACTIVATION_ROLLUP_BUCKETS: usize = 120;
 const MODEL_REVIEW_ROLLUP_BUCKETS: usize = 300;
 const MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS: usize = 960;
@@ -158,6 +162,8 @@ struct PersistedSymbolHistory {
     recent: Vec<PositionHistorySample>,
     #[serde(default)]
     rollups: Vec<HistoryRollupBucket>,
+    #[serde(default)]
+    candles: Vec<CandleBar>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,7 +471,7 @@ struct RawCandle {
     volume: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CandleBar {
     start: i64,
     low: f64,
@@ -476,7 +482,7 @@ struct CandleBar {
 }
 
 fn history_format_version() -> u32 {
-    3
+    4
 }
 
 fn now_millis() -> u64 {
@@ -500,10 +506,17 @@ fn history_signature(history: Option<&PersistedSymbolHistory>) -> u64 {
         .last()
         .map(|item| item.bucket_start_ms)
         .unwrap_or(0);
+    let candle_latest = history
+        .candles
+        .last()
+        .map(|item| item.start as u64)
+        .unwrap_or(0);
     recent_latest
         ^ rollup_latest.rotate_left(13)
+        ^ candle_latest.rotate_left(27)
         ^ ((history.recent.len() as u64) << 1)
         ^ ((history.rollups.len() as u64) << 33)
+        ^ ((history.candles.len() as u64) << 17)
 }
 
 fn rollup_buckets_to_hours(bucket_count: usize) -> f64 {
@@ -708,18 +721,33 @@ fn risk_score(value: &str) -> Option<f64> {
     }
 }
 
-fn fetch_public_product_candles(client: &Client, product_id: &str) -> Result<Vec<CandleBar>> {
-    let end = Utc::now().timestamp();
-    let span_seconds = MODEL_CANDLE_LIMIT as i64 * MODEL_GRANULARITY_MINUTES as i64 * 60;
-    let mut candles = Vec::new();
-    for window_index in 0..MODEL_CANDLE_WINDOWS {
-        let window_end = end - (window_index as i64 * span_seconds);
-        let window_start = window_end - span_seconds;
-        let url = format!(
-            "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles?start={window_start}&end={window_end}&granularity={MODEL_CANDLE_GRANULARITY}&limit={MODEL_CANDLE_LIMIT}"
-        );
-        let response: CandleResponse = get_json(client, &url, true)?;
-        candles.extend(response.candles.into_iter().filter_map(|item| {
+fn candle_window_span_seconds() -> i64 {
+    MODEL_CANDLE_LIMIT as i64 * MODEL_GRANULARITY_MINUTES as i64 * 60
+}
+
+fn trim_candle_archive(candles: &mut Vec<CandleBar>) {
+    candles.sort_by_key(|item| item.start);
+    candles.dedup_by_key(|item| item.start);
+    if candles.len() > MAX_PERSISTED_CANDLES {
+        let overflow = candles.len() - MAX_PERSISTED_CANDLES;
+        candles.drain(0..overflow);
+    }
+}
+
+fn fetch_public_product_candle_window(
+    client: &Client,
+    product_id: &str,
+    window_start: i64,
+    window_end: i64,
+) -> Result<Vec<CandleBar>> {
+    let url = format!(
+        "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles?start={window_start}&end={window_end}&granularity={MODEL_CANDLE_GRANULARITY}&limit={MODEL_CANDLE_LIMIT}"
+    );
+    let response: CandleResponse = get_json(client, &url, true)?;
+    Ok(response
+        .candles
+        .into_iter()
+        .filter_map(|item| {
             Some(CandleBar {
                 start: parse_timestamp(&item.start)?,
                 low: parse_number(&item.low)?,
@@ -728,10 +756,76 @@ fn fetch_public_product_candles(client: &Client, product_id: &str) -> Result<Vec
                 close: parse_number(&item.close)?,
                 volume: parse_number(&item.volume).unwrap_or(0.0),
             })
-        }));
+        })
+        .collect())
+}
+
+fn fetch_public_product_candles(client: &Client, product_id: &str) -> Result<Vec<CandleBar>> {
+    let end = Utc::now().timestamp();
+    let span_seconds = candle_window_span_seconds();
+    let mut candles = Vec::new();
+    for window_index in 0..MODEL_CANDLE_WINDOWS {
+        let window_end = end - (window_index as i64 * span_seconds);
+        let window_start = window_end - span_seconds;
+        candles.extend(fetch_public_product_candle_window(
+            client,
+            product_id,
+            window_start,
+            window_end,
+        )?);
     }
-    candles.sort_by_key(|item| item.start);
-    candles.dedup_by_key(|item| item.start);
+    trim_candle_archive(&mut candles);
+    Ok(candles)
+}
+
+fn sync_persisted_candle_archive(
+    client: &Client,
+    product_id: &str,
+    existing: &[CandleBar],
+) -> Result<Vec<CandleBar>> {
+    let now = Utc::now().timestamp();
+    let span_seconds = candle_window_span_seconds();
+    let mut candles = existing.to_vec();
+
+    for window_index in 0..MODEL_CANDLE_RECENT_WINDOWS {
+        let window_end = now - (window_index as i64 * span_seconds);
+        let window_start = window_end - span_seconds;
+        candles.extend(fetch_public_product_candle_window(
+            client,
+            product_id,
+            window_start,
+            window_end,
+        )?);
+    }
+
+    trim_candle_archive(&mut candles);
+
+    if candles.len() < MODEL_CANDLE_ARCHIVE_TARGET_BARS {
+        let mut next_window_end = candles
+            .first()
+            .map(|item| item.start.saturating_sub(1))
+            .unwrap_or(now);
+        for _ in 0..MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS {
+            if candles.len() >= MODEL_CANDLE_ARCHIVE_TARGET_BARS || next_window_end <= 0 {
+                break;
+            }
+            let window_start = next_window_end.saturating_sub(span_seconds);
+            let previous_oldest = candles.first().map(|item| item.start);
+            candles.extend(fetch_public_product_candle_window(
+                client,
+                product_id,
+                window_start,
+                next_window_end,
+            )?);
+            trim_candle_archive(&mut candles);
+            let new_oldest = candles.first().map(|item| item.start);
+            next_window_end = new_oldest
+                .filter(|oldest| Some(*oldest) != previous_oldest)
+                .map(|oldest| oldest.saturating_sub(1))
+                .unwrap_or_else(|| window_start.saturating_sub(1));
+        }
+    }
+
     Ok(candles)
 }
 
@@ -1160,7 +1254,7 @@ fn rollup_samples_for_target(
     candles: &[CandleBar],
     target: PredictionTarget,
 ) -> (Vec<LabeledFeatureSample>, Option<Vec<f64>>) {
-    let mut samples = Vec::new();
+    let mut samples_by_source = HashMap::<usize, LabeledFeatureSample>::new();
     let mut latest_features = None;
     for rollup_index in 0..history.rollups.len() {
         let Some((features, source_index)) = rollup_feature_vector(history, candles, rollup_index) else {
@@ -1175,13 +1269,15 @@ fn rollup_samples_for_target(
         if current_close <= 0.0 || future_close <= 0.0 {
             continue;
         }
-        samples.push(LabeledFeatureSample {
+        samples_by_source.insert(source_index, LabeledFeatureSample {
             source_index,
             target_index,
             features,
             label: (future_close > current_close) as u8 as f64,
         });
     }
+    let mut samples = samples_by_source.into_values().collect::<Vec<_>>();
+    samples.sort_by_key(|item| item.source_index);
     (samples, latest_features)
 }
 
@@ -1402,7 +1498,10 @@ fn build_model_prediction(
     product_id: &str,
     history: Option<&PersistedSymbolHistory>,
 ) -> Result<ModelPrediction> {
-    let candles = fetch_public_product_candles(client, product_id)?;
+    let candles = history
+        .filter(|item| !item.candles.is_empty())
+        .map(|item| item.candles.clone())
+        .unwrap_or(fetch_public_product_candles(client, product_id)?);
     let mut built = Vec::new();
     for target in MODEL_TARGETS {
         let mut prediction = if let Some(history) = history {
@@ -2011,6 +2110,7 @@ fn trim_history(history: &mut HashMap<String, PersistedSymbolHistory>) {
             let overflow = symbol_history.rollups.len() - MAX_ROLLUP_BUCKETS;
             symbol_history.rollups.drain(0..overflow);
         }
+        trim_candle_archive(&mut symbol_history.candles);
     }
 }
 
@@ -2133,11 +2233,13 @@ fn load_history_file(path: &PathBuf) -> Result<HashMap<String, PersistedSymbolHi
                 PersistedSymbolHistoryCompatEntry::Legacy(recent) => PersistedSymbolHistory {
                     rollups: rebuild_rollups(&recent),
                     recent,
+                    candles: Vec::new(),
                 },
                 PersistedSymbolHistoryCompatEntry::Current(mut current) => {
                     if current.rollups.is_empty() && !current.recent.is_empty() {
                         current.rollups = rebuild_rollups(&current.recent);
                     }
+                    trim_candle_archive(&mut current.candles);
                     current
                 }
             };
@@ -2257,6 +2359,15 @@ fn upsert_history_sample(
         symbol_history.recent.push(sample.clone());
         push_sample_into_rollups(&mut symbol_history.rollups, &sample);
     }
+}
+
+fn upsert_candle_archive(
+    history: &mut HashMap<String, PersistedSymbolHistory>,
+    symbol: &str,
+    candles: Vec<CandleBar>,
+) {
+    let symbol_history = history.entry(symbol.to_string()).or_default();
+    symbol_history.candles = candles;
 }
 
 fn history_sample(
@@ -4205,15 +4316,71 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     loaded_context
                 }
             };
+            let prediction_symbols = output
+                .positions
+                .iter()
+                .map(|position| position.symbol.clone())
+                .chain(output.watch_markets.iter().map(|watch| watch.symbol.clone()))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let existing_candle_archives = match state.history.lock() {
+                Ok(history) => prediction_symbols
+                    .iter()
+                    .map(|symbol| {
+                        (
+                            symbol.clone(),
+                            history
+                                .get(symbol)
+                                .map(|item| item.candles.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Dashboard history lock is poisoned".to_string(),
+                    )
+                        .into_response()
+                }
+            };
+            let synced_candle_archives = match tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<CandleBar>>> {
+                let client = build_http_client()?;
+                let mut archives = HashMap::new();
+                for (symbol, existing) in existing_candle_archives {
+                    archives.insert(
+                        symbol.clone(),
+                        sync_persisted_candle_archive(&client, &symbol, &existing)?,
+                    );
+                }
+                Ok(archives)
+            })
+            .await
+            {
+                Ok(Ok(items)) => items,
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to sync candle archive: {error:#}"),
+                    )
+                        .into_response()
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Candle archive worker failed: {error}"),
+                    )
+                        .into_response()
+                }
+            };
             let (position_history, prediction_inputs) = match state.history.lock() {
                 Ok(mut history) => {
+                    for (symbol, candles) in synced_candle_archives {
+                        upsert_candle_archive(&mut history, &symbol, candles);
+                    }
                     let summaries = upsert_history(&mut history, &output, &market_context);
-                    let prediction_inputs = output
-                        .positions
-                        .iter()
-                        .map(|position| position.symbol.clone())
-                        .chain(output.watch_markets.iter().map(|watch| watch.symbol.clone()))
-                        .collect::<std::collections::HashSet<_>>()
+                    let prediction_inputs = prediction_symbols
                         .into_iter()
                         .map(|symbol| (symbol.clone(), history.get(&symbol).cloned()))
                         .collect::<Vec<_>>();
