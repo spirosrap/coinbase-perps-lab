@@ -200,12 +200,15 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - if the chronological holdout does not beat a naive baseline, the model neutralizes itself to `50/50` and reports `no_edge`
 - `Variant` shows whether you are seeing the `history_augmented` or `candle_only` path
 - `Edge vs Base` shows the holdout accuracy delta versus the naive majority-class baseline, in percentage points
-- `Evaluation Method` is now an expanding walk-forward evaluation on non-overlapping `60` minute holdout anchors
+- `Evaluation Method` is now an expanding walk-forward evaluation on non-overlapping holdout anchors
+- `Holdout Anchors` shows how many independent out-of-sample anchors were actually scored
+- `Independent Test Depth` converts those anchors to an approximate time span for fixed-minute horizons
 - `Holdout Up` shows the fraction of holdout examples labeled up
 - `Majority Side` shows which side the naive baseline would always predict
 - `Balanced Acc` is the mean of up-side recall and down-side recall when both classes exist in the holdout set
 - `MCC` is the Matthews correlation coefficient, which is more informative than plain accuracy under class imbalance
-- `History Collected` shows how much persisted 5-minute rollup history the dashboard has for that symbol
+- `Raw Rollup History` shows how much persisted 5-minute rollup history the dashboard has for that symbol
+- raw rollup history is retained archive depth; it is not the same thing as independent holdout depth
 - `Augmented Model` shows whether the richer model is active yet or how much local history is still needed
 - readiness thresholds are:
 - activation at `120` rollup buckets, about `10` hours

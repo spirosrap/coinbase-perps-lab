@@ -3866,6 +3866,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
           ? formatMaybe(item.matthews_corrcoef, 3)
           : (oneClassHoldout ? "N/A (one-class)" : "unknown");
         const brier = item.brier_score != null ? formatMaybe(item.brier_score, 3) : "unknown";
+        const independentDepth = Number(item.horizon_minutes || 0) > 0
+          ? `${String(item.test_samples || 0)} anchors (~${formatMaybe((Number(item.test_samples || 0) * Number(item.horizon_minutes || 0)) / 60, 1)}h)`
+          : `${String(item.test_samples || 0)} anchors`;
         const lowSampleWarning = Number(item.test_samples || 0) < 12
           ? `<span class="badge warn">thin test window</span>`
           : "";
@@ -3892,7 +3895,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
               ${statCard("P Up", up, toneClass(item.probability_up != null ? item.probability_up - 0.5 : null))}
               ${statCard("P Down", down, toneClass(item.probability_down != null ? item.probability_down - 0.5 : null))}
               ${statCard("Train Samples", String(item.training_samples || 0))}
-              ${statCard("Test Samples", String(item.test_samples || 0))}
+              ${statCard("Holdout Anchors", String(item.test_samples || 0))}
+              ${statCard("Independent Depth", independentDepth)}
               ${statCard("Holdout Up", holdoutUpRate)}
               ${statCard("Majority Side", item.majority_label || "unknown")}
               ${statCard("Test Accuracy", testAcc)}
@@ -3903,11 +3907,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
               ${statCard("Brier", brier)}
               ${statCard("Variant", item.variant === "history_augmented" ? "history-augmented" : (item.variant === "candle_only" ? "candle-only" : (item.variant || "unknown")))}
               ${statCard("Status", item.status || "unknown")}
-              ${isPrimary ? statCard("History Collected", `${formatMaybe(item.rollup_hours_collected, 1)}h`) : ""}
+              ${isPrimary ? statCard("Raw Rollup History", `${formatMaybe(item.rollup_hours_collected, 1)}h`) : ""}
               ${isPrimary ? statCard("Augmented Model", item.buckets_until_activation > 0 ? `${formatMaybe(item.hours_until_activation, 1)}h left` : "active") : ""}
             </div>
             <div class="signal-note">This model is experimental. It is separate from the execution gate and does not override risk controls.</div>
             <div class="signal-note">${escapeHtml(item.evaluation_method || "Evaluation method unknown.")}</div>
+            <div class="signal-note">Raw rollup history is retained archive depth. Holdout anchors / independent depth are the actual out-of-sample checks.</div>
             ${sampleNote ? `<div class="signal-note">${escapeHtml(sampleNote)}</div>` : ""}
             ${isPrimary ? `<div class="signal-note">Thresholds: activate at 120 buckets (~10.0h), first review at 300 buckets (~25.0h), serious trust at 960 buckets (~80.0h).</div>` : ""}
             <ul class="history-insights">${(item.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>
