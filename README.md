@@ -152,7 +152,7 @@ The dashboard also adds a conservative setup layer:
 - live open-order visibility for current futures/perpetual orders
 - stale reduce-only cleanup review when no matching position is open
 - live stock-perp watch cards for all currently available Coinbase INTX equity and equity-ETF perpetuals
-- a compact top-of-page entry shortlist that keeps the current position and top ranked stock-perp candidates visible without scrolling through the full watch section
+- a compact top-of-page entry shortlist that keeps the current position and top ranked stock-perp candidates visible without scrolling through the full watch section, with sequential allocation on remaining deployable margin
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
 - an experimental multi-horizon directional baseline model that trains locally on `5` minute data and shows `1h`, `4h`, and `next close` forecasts, with walk-forward validation stats, model variant, class balance, and edge versus baseline
@@ -173,6 +173,8 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - `aligned` but not `ready` uses `40%`, keeps `60%` in reserve, and allows up to `75%` of the leverage cap
 - `mixed` uses `25%`, keeps `75%` in reserve, and allows up to `50%` of the leverage cap
 - `avoid aggression` uses `0%` and waits
+- in the top shortlist, those percentages are applied sequentially on the remaining deployable margin, not independently on the full account each time
+- `Suggested Actual Lev` is normalized to whole-number execution steps, so a fractional raw target such as `1.5x` is displayed as `1x`
 - `Macro Risk` is now a combined context label:
 - `scheduled risk` comes from FOMC plus the official White House / OIRA macro calendar, and may also include the earnings proxy schedule for US equity ETF/perp watches
 - `headline risk` comes from a keyword-based geopolitical news scan and is heuristic by construction

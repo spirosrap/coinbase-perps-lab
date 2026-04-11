@@ -418,6 +418,7 @@ struct EntrySizingPlan {
     margin_usage_pct: f64,
     reserve_pct: f64,
     leverage_fraction_pct: f64,
+    raw_suggested_actual_leverage: f64,
     suggested_actual_leverage: f64,
     summary: String,
     notes: Vec<String>,
@@ -3067,7 +3068,7 @@ fn build_watch_entry_sizing_plan(
     assessment: &TradeSetupAssessment,
     checklist: &EntryChecklist,
 ) -> EntrySizingPlan {
-    let (status, margin_usage_pct, reserve_pct, leverage_fraction_pct, summary, notes) =
+    let (status, margin_usage_pct, reserve_pct, leverage_fraction_pct, summary, mut notes) =
         if checklist.overall_status == "ready" {
             (
                 "ready".to_string(),
@@ -3128,21 +3129,43 @@ fn build_watch_entry_sizing_plan(
             }
         };
 
-    let suggested_actual_leverage = if leverage_fraction_pct <= 0.0 {
+    let raw_suggested_actual_leverage = if leverage_fraction_pct <= 0.0 {
         0.0
     } else {
         assessment.suggested_max_leverage * (leverage_fraction_pct / 100.0)
     };
+    let suggested_actual_leverage = normalize_execution_leverage(
+        raw_suggested_actual_leverage,
+        assessment.suggested_max_leverage,
+    );
+    if raw_suggested_actual_leverage > 0.0
+        && (raw_suggested_actual_leverage - suggested_actual_leverage).abs() > 0.001
+    {
+        notes.push(format!(
+            "Execution leverage is normalized to whole-number steps; raw target {:.1}x becomes {:.0}x.",
+            raw_suggested_actual_leverage, suggested_actual_leverage
+        ));
+    }
 
     EntrySizingPlan {
         status,
         margin_usage_pct,
         reserve_pct,
         leverage_fraction_pct,
+        raw_suggested_actual_leverage,
         suggested_actual_leverage,
         summary,
         notes,
     }
+}
+
+fn normalize_execution_leverage(raw_target: f64, max_cap: f64) -> f64 {
+    if raw_target <= 0.0 {
+        return 0.0;
+    }
+
+    let integer_cap = max_cap.floor().max(1.0);
+    raw_target.floor().max(1.0).min(integer_cap)
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -3666,7 +3689,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `<div class="stat"><div class="stat-label">${escapeHtml(label)}</div><div class="stat-value ${extraClass}">${escapeHtml(value)}</div></div>`;
     }
 
-    function shortlistTile({ symbol, subtitle, status, lev, marginUse, modelBias, probabilityUp, note }) {
+    function shortlistTile({
+      symbol,
+      subtitle,
+      status,
+      lev,
+      marginUse,
+      allocationTotal,
+      allocationOfRemaining,
+      modelBias,
+      probabilityUp,
+      note
+    }) {
       const probabilityText = probabilityUp != null ? `P up 1h ${formatMaybe(probabilityUp * 100, 1)}%` : null;
       return `
         <article class="candidate-tile">
@@ -3675,7 +3709,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="candidate-badges">
             ${status ? `<span class="badge ${badgeClass(status)}">${escapeHtml(status)}</span>` : ""}
             ${lev != null ? `<span class="badge neutral">cap ${escapeHtml(formatMaybe(lev, 0))}x</span>` : ""}
-            ${marginUse != null ? `<span class="badge neutral">use ${escapeHtml(formatMaybe(marginUse, 0))}%</span>` : ""}
+            ${allocationTotal != null ? `<span class="badge neutral">alloc ${escapeHtml(formatMaybe(allocationTotal, 1))}% total</span>` : ""}
+            ${allocationOfRemaining != null ? `<span class="badge neutral">use ${escapeHtml(formatMaybe(allocationOfRemaining, 0))}% rem</span>` : ""}
+            ${allocationTotal == null && marginUse != null ? `<span class="badge neutral">use ${escapeHtml(formatMaybe(marginUse, 0))}%</span>` : ""}
             ${modelBias ? `<span class="badge ${badgeClass(modelBias)}">${escapeHtml(modelBias)}</span>` : ""}
           </div>
           <div class="candidate-meta">${escapeHtml([note, probabilityText].filter(Boolean).join(" · ") || "No extra context")}</div>
@@ -3918,9 +3954,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Margin Use", `${formatMaybe(plan.margin_usage_pct, 0)}%`)}
             ${statCard("Reserve", `${formatMaybe(plan.reserve_pct, 0)}%`)}
             ${statCard("Lev Use of Cap", `${formatMaybe(plan.leverage_fraction_pct, 0)}%`)}
-            ${statCard("Suggested Actual Lev", plan.suggested_actual_leverage > 0 ? `${formatMaybe(plan.suggested_actual_leverage, 1)}x` : "wait")}
+            ${statCard("Suggested Actual Lev", plan.suggested_actual_leverage > 0 ? `${formatMaybe(plan.suggested_actual_leverage, 0)}x` : "wait")}
           </div>
-          <div class="signal-note">Percentages refer to currently available INTX margin, not total account equity.</div>
+          <div class="signal-note">Percentages refer to currently available INTX margin, not total account equity. In the shortlist, multiple candidates cascade on the remaining deployable margin.</div>
           <ul class="history-insights">${notes}</ul>
         </section>
       `;
@@ -4056,7 +4092,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             ${statCard("Suggested Max Lev", assessment?.suggested_max_leverage != null ? `${formatMaybe(assessment.suggested_max_leverage, 0)}x` : "unknown")}
             ${statCard("Margin Use", sizingPlan?.margin_usage_pct != null ? `${formatMaybe(sizingPlan.margin_usage_pct, 0)}%` : "unknown")}
             ${statCard("Reserve", sizingPlan?.reserve_pct != null ? `${formatMaybe(sizingPlan.reserve_pct, 0)}%` : "unknown")}
-            ${statCard("Actual Lev", sizingPlan?.suggested_actual_leverage > 0 ? `${formatMaybe(sizingPlan.suggested_actual_leverage, 1)}x` : "wait")}
+            ${statCard("Actual Lev", sizingPlan?.suggested_actual_leverage > 0 ? `${formatMaybe(sizingPlan.suggested_actual_leverage, 0)}x` : "wait")}
             ${statCard("Model Bias", prediction?.model_bias || "unknown", badgeClass(prediction?.model_bias || ""))}
             ${statCard("P Up 1h", prediction?.probability_up != null ? `${formatMaybe(prediction.probability_up * 100, 1)}%` : "unknown", toneClass(prediction?.probability_up != null ? prediction.probability_up - 0.5 : null))}
           </div>
@@ -4139,10 +4175,48 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return sortedWatches(snapshot)[0] || null;
     }
 
+    function buildShortlistAllocationItems(snapshot, limit = 4) {
+      const watches = sortedWatches(snapshot);
+      const items = [];
+      let remainingPct = 100.0;
+
+      for (const watch of watches) {
+        const assessment = snapshot.watch_assessments?.[watch.symbol];
+        const checklist = snapshot.watch_entry_checklists?.[watch.symbol];
+        const sizingPlan = snapshot.watch_entry_sizing_plans?.[watch.symbol];
+        const prediction = snapshot.watch_predictions?.[watch.symbol];
+        const marginUsePct = Number(sizingPlan?.margin_usage_pct ?? 0);
+        if (!(marginUsePct > 0)) {
+          continue;
+        }
+
+        const allocationTotal = remainingPct * (marginUsePct / 100.0);
+        remainingPct -= allocationTotal;
+        items.push({
+          symbol: watch.symbol,
+          subtitle: watch.display_name || "Stock-perp watch",
+          status: checklist?.overall_status || assessment?.alignment_status || "watch",
+          lev: sizingPlan?.suggested_actual_leverage ?? assessment?.suggested_max_leverage ?? null,
+          marginUse: marginUsePct,
+          allocationTotal,
+          allocationOfRemaining: marginUsePct,
+          modelBias: prediction?.model_bias || null,
+          probabilityUp: prediction?.probability_up ?? null,
+          note: `${assessment?.execution_risk ? `execution ${assessment.execution_risk}` : "watching"}; ${formatMaybe(remainingPct, 1)}% of deployable margin remains after this`,
+        });
+
+        if (items.length >= limit) {
+          break;
+        }
+      }
+
+      return { items, remainingPct };
+    }
+
     function renderCandidateStrip(snapshot) {
       const strip = document.getElementById("candidateStrip");
       const positions = snapshot.positions || [];
-      const watches = sortedWatches(snapshot);
+      const shortlist = buildShortlistAllocationItems(snapshot);
       const items = [];
 
       for (const pos of positions.slice(0, 1)) {
@@ -4154,28 +4228,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
           status: assessment?.alignment_status || pos.position_outlook || "live",
           lev: assessment?.suggested_max_leverage ?? null,
           marginUse: null,
+          allocationTotal: null,
+          allocationOfRemaining: null,
           modelBias: prediction?.model_bias || null,
           probabilityUp: prediction?.probability_up ?? null,
-          note: `holding ${pos.contracts || "unknown"} contracts`,
+          note: `holding ${pos.contracts || "unknown"} contracts; excluded from new-entry cascade`,
         });
       }
 
-      for (const watch of watches.slice(0, 4)) {
-        const assessment = snapshot.watch_assessments?.[watch.symbol];
-        const checklist = snapshot.watch_entry_checklists?.[watch.symbol];
-        const sizingPlan = snapshot.watch_entry_sizing_plans?.[watch.symbol];
-        const prediction = snapshot.watch_predictions?.[watch.symbol];
-        items.push({
-          symbol: watch.symbol,
-          subtitle: watch.display_name || "Stock-perp watch",
-          status: checklist?.overall_status || assessment?.alignment_status || "watch",
-          lev: assessment?.suggested_max_leverage ?? null,
-          marginUse: sizingPlan?.margin_usage_pct ?? null,
-          modelBias: prediction?.model_bias || null,
-          probabilityUp: prediction?.probability_up ?? null,
-          note: assessment?.execution_risk ? `execution ${assessment.execution_risk}` : "watching",
-        });
-      }
+      items.push(...shortlist.items);
 
       if (!items.length) {
         strip.innerHTML = "";
@@ -4187,10 +4248,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="card-header">
             <div>
               <h2 class="card-title">Entry Shortlist</h2>
-              <div class="subtext">Current position plus the top ranked stock-perp candidates, so you do not need to scroll through the full watch list.</div>
+              <div class="subtext">Current position plus the top ranked stock-perp candidates. New-entry sizing now cascades on remaining deployable margin, so lower-ranked ideas get a smaller slice automatically.</div>
             </div>
           </div>
           <div class="candidate-list">${items.map((item) => shortlistTile(item)).join("")}</div>
+          <div class="signal-note">Each candidate uses its stated sizing percentage on the remaining deployable margin after higher-ranked candidates. Current positions are displayed for context and do not consume this new-entry cascade.</div>
+          <div class="signal-note">Unallocated deployable margin after the visible shortlist: ${escapeHtml(formatMaybe(shortlist.remainingPct, 1))}%.</div>
         </section>
       `;
     }

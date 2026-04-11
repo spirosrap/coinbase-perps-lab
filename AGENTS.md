@@ -49,6 +49,8 @@ The current discovery script prefers the perps pair first.
 - Fetch portfolios first, then select the `INTX` portfolio before querying positions
 - Prefer returning concise summaries plus optional JSON output for automation
 - When behavior depends on Coinbase specifics, verify against current upstream docs or observed API behavior
+- For execution sizing, treat leverage as a whole-number control in this workflow; do not target fractional leverage such as `1.5x` or `2.5x`
+- Let margin allocation absorb the difference when the raw sizing math lands between integer leverage steps
 
 ## Documentation rules
 
