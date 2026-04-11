@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_HOST: &str = "api.coinbase.com";
@@ -31,6 +32,24 @@ struct Credentials {
 #[derive(Debug, Deserialize)]
 struct PortfoliosResponse {
     portfolios: Vec<Portfolio>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductsResponse {
+    products: Vec<ListedProduct>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListedProduct {
+    product_id: String,
+    #[serde(default)]
+    is_disabled: bool,
+    #[serde(default)]
+    trading_disabled: bool,
+    #[serde(default)]
+    cancel_only: bool,
+    #[serde(default)]
+    future_product_details: Option<FutureProductDetails>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -567,6 +586,43 @@ fn fetch_portfolio_summary(
     let path = format!("/api/v3/brokerage/intx/portfolio/{portfolio_id}");
     let response: IntxPortfolioSummaryResponse = get_json(client, credentials, &path)?;
     Ok(response.portfolios)
+}
+
+fn fetch_perpetual_future_products(
+    client: &Client,
+    credentials: &Credentials,
+) -> Result<Vec<ListedProduct>> {
+    let path = "/api/v3/brokerage/products";
+    let token = build_jwt(&credentials.api_key, &credentials.api_secret, "GET", path)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("failed to build authorization header")?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let response = client
+        .get(format!("{API_BASE}{path}"))
+        .headers(headers)
+        .query(&[
+            ("product_type", "FUTURE"),
+            ("contract_expiry_type", "PERPETUAL"),
+            ("limit", "500"),
+        ])
+        .send()
+        .with_context(|| format!("request failed for GET {path}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!("Coinbase returned {status} for GET {path}: {body}");
+    }
+
+    let response: ProductsResponse = response
+        .json::<ProductsResponse>()
+        .with_context(|| format!("failed to decode Coinbase JSON for GET {path}"))?;
+    Ok(response.products)
 }
 
 fn fetch_open_orders(client: &Client, credentials: &Credentials) -> Result<Vec<RawOrder>> {
@@ -1520,6 +1576,29 @@ pub fn load_output(portfolio_id: Option<&str>) -> Result<Output> {
     load_output_with_watch(portfolio_id, &[])
 }
 
+pub fn load_available_stock_watch_symbols() -> Result<Vec<String>> {
+    dotenv().ok();
+
+    let credentials = get_credentials()?;
+    let client = build_client()?;
+    let mut symbols = fetch_perpetual_future_products(&client, &credentials)?
+        .into_iter()
+        .filter(|product| !product.is_disabled && !product.trading_disabled && !product.cancel_only)
+        .filter_map(|product| {
+            let underlying_type = product
+                .future_product_details
+                .as_ref()
+                .and_then(|details| details.perpetual_details.as_ref())
+                .and_then(|details| details.underlying_type.as_deref());
+            matches!(underlying_type, Some("EQUITY") | Some("EQUITY_ETF"))
+                .then_some(product.product_id)
+        })
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    Ok(symbols)
+}
+
 pub fn load_output_with_watch(
     portfolio_id: Option<&str>,
     watch_symbols: &[String],
@@ -1543,13 +1622,31 @@ pub fn load_output_with_watch(
     all_symbols.extend(raw_open_orders.iter().map(|order| order.product_id.clone()));
     all_symbols.sort();
     all_symbols.dedup();
-    for symbol in &all_symbols {
-        product_cache
-            .entry(symbol.clone())
-            .or_insert_with(|| fetch_product(&client, &credentials, symbol));
-        product_book_cache
-            .entry(symbol.clone())
-            .or_insert_with(|| fetch_product_book(&client, &credentials, symbol));
+    let fetch_results = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for symbol in all_symbols.clone() {
+            let client = client.clone();
+            let credentials = credentials.clone();
+            handles.push(scope.spawn(move || {
+                let product = fetch_product(&client, &credentials, &symbol);
+                let product_book = fetch_product_book(&client, &credentials, &symbol);
+                (symbol, product, product_book)
+            }));
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("product fetch worker panicked"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    for (symbol, product, product_book) in fetch_results {
+        product_cache.insert(symbol.clone(), product);
+        product_book_cache.insert(symbol, product_book);
     }
 
     let portfolio_state_lookup: HashMap<&str, &IntxPortfolioState> = portfolio_states

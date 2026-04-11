@@ -151,7 +151,7 @@ The dashboard also adds a conservative setup layer:
 - a heuristic setup status and suggested max leverage per position
 - live open-order visibility for current futures/perpetual orders
 - stale reduce-only cleanup review when no matching position is open
-- flat-mode re-entry watch cards for recently tracked symbols
+- live stock-perp watch cards for all currently available Coinbase INTX equity and equity-ETF perpetuals
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
 - an experimental multi-horizon directional baseline model that trains locally on `5` minute data and shows `1h`, `4h`, and `next close` forecasts, with walk-forward validation stats, model variant, class balance, and edge versus baseline
@@ -258,6 +258,10 @@ Funding intensity thresholds in this tool are heuristic:
 - `elevated`: up to `0.05%`
 - `large`: up to `0.10%`
 - `very large`: above `0.10%`
+
+The dashboard no longer depends on a single hardcoded watch symbol. It now pulls the current Coinbase INTX perpetual product list, filters it to stock-linked markets (`EQUITY` and `EQUITY_ETF`), and renders the full available stock-perp universe in the watch section. If you have an open position, the dashboard still renders the remaining stock-perp watch cards underneath the live position cards so the scan stays useful while you are in a trade.
+
+For the full stock-perp scan, the first dashboard snapshot is heavier because it has to refresh multiple markets and warm local caches. After that, the server keeps a short in-memory snapshot cache so normal browser polling does not recompute the entire stock-perp universe on every refresh.
 
 Open interest is intentionally kept more factual than interpretive. A single snapshot can tell you:
 

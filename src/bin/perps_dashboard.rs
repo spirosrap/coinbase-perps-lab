@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::America::New_York;
 use clap::Parser;
 use coinbase_perps_lab::{
-    load_output_with_watch, OrderBookSummary, Output, PositionSummary, SlippageEstimate,
-    WatchMarketSummary,
+    load_available_stock_watch_symbols, load_output_with_watch, OrderBookSummary, Output,
+    PositionSummary, SlippageEstimate, WatchMarketSummary,
 };
 use pdf_extract::extract_text_from_mem;
 use regex::Regex;
@@ -31,6 +31,7 @@ const MAX_POINTS_PER_SERIES: usize = 120;
 const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 const MARKET_CONTEXT_TTL_MS: u64 = 30 * 60 * 1000;
 const MODEL_PREDICTION_TTL_MS: u64 = 5 * 60 * 1000;
+const SNAPSHOT_CACHE_TTL_MS: u64 = 60 * 1000;
 const MODEL_CANDLE_GRANULARITY: &str = "FIVE_MINUTE";
 const MODEL_GRANULARITY_MINUTES: u32 = 5;
 const MODEL_HORIZON_MINUTES: u32 = 60;
@@ -38,7 +39,7 @@ const MODEL_CANDLE_LIMIT: usize = 350;
 const MODEL_CANDLE_WINDOWS: usize = 6;
 const MODEL_CANDLE_RECENT_WINDOWS: usize = 2;
 const MODEL_CANDLE_ARCHIVE_TARGET_BARS: usize = 2_500;
-const MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS: usize = 24;
+const MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS_PER_SYNC: usize = 1;
 const MODEL_ACTIVATION_ROLLUP_BUCKETS: usize = 120;
 const MODEL_REVIEW_ROLLUP_BUCKETS: usize = 300;
 const MODEL_SERIOUS_TRUST_ROLLUP_BUCKETS: usize = 960;
@@ -105,6 +106,7 @@ struct AppState {
     history: Mutex<HashMap<String, PersistedSymbolHistory>>,
     market_context_cache: Mutex<Option<CachedMarketContext>>,
     prediction_cache: Mutex<HashMap<String, CachedPrediction>>,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +126,12 @@ struct CachedPrediction {
     loaded_at_ms: u64,
     history_signature: u64,
     prediction: ModelPrediction,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSnapshot {
+    loaded_at_ms: u64,
+    body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,6 +733,10 @@ fn candle_window_span_seconds() -> i64 {
     MODEL_CANDLE_LIMIT as i64 * MODEL_GRANULARITY_MINUTES as i64 * 60
 }
 
+fn candle_granularity_seconds() -> i64 {
+    MODEL_GRANULARITY_MINUTES as i64 * 60
+}
+
 fn trim_candle_archive(candles: &mut Vec<CandleBar>) {
     candles.sort_by_key(|item| item.start);
     candles.dedup_by_key(|item| item.start);
@@ -732,6 +744,10 @@ fn trim_candle_archive(candles: &mut Vec<CandleBar>) {
         let overflow = candles.len() - MAX_PERSISTED_CANDLES;
         candles.drain(0..overflow);
     }
+}
+
+fn is_remote_rate_limited(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("429 Too Many Requests")
 }
 
 fn fetch_public_product_candle_window(
@@ -786,37 +802,50 @@ fn sync_persisted_candle_archive(
     let now = Utc::now().timestamp();
     let span_seconds = candle_window_span_seconds();
     let mut candles = existing.to_vec();
+    trim_candle_archive(&mut candles);
 
-    for window_index in 0..MODEL_CANDLE_RECENT_WINDOWS {
-        let window_end = now - (window_index as i64 * span_seconds);
-        let window_start = window_end - span_seconds;
-        candles.extend(fetch_public_product_candle_window(
-            client,
-            product_id,
-            window_start,
-            window_end,
-        )?);
+    let refresh_cutoff = now.saturating_sub(candle_granularity_seconds() * 2);
+    let archive_is_fresh = candles
+        .last()
+        .map(|item| item.start >= refresh_cutoff)
+        .unwrap_or(false);
+
+    if !archive_is_fresh {
+        for window_index in 0..MODEL_CANDLE_RECENT_WINDOWS {
+            let window_end = now - (window_index as i64 * span_seconds);
+            let window_start = window_end - span_seconds;
+            match fetch_public_product_candle_window(client, product_id, window_start, window_end) {
+                Ok(window) => candles.extend(window),
+                Err(error) if is_remote_rate_limited(&error) => {
+                    trim_candle_archive(&mut candles);
+                    return Ok(candles);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     trim_candle_archive(&mut candles);
 
-    if candles.len() < MODEL_CANDLE_ARCHIVE_TARGET_BARS {
+    if !existing.is_empty() && candles.len() < MODEL_CANDLE_ARCHIVE_TARGET_BARS {
         let mut next_window_end = candles
             .first()
             .map(|item| item.start.saturating_sub(1))
             .unwrap_or(now);
-        for _ in 0..MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS {
+        for _ in 0..MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS_PER_SYNC {
             if candles.len() >= MODEL_CANDLE_ARCHIVE_TARGET_BARS || next_window_end <= 0 {
                 break;
             }
             let window_start = next_window_end.saturating_sub(span_seconds);
             let previous_oldest = candles.first().map(|item| item.start);
-            candles.extend(fetch_public_product_candle_window(
-                client,
-                product_id,
-                window_start,
-                next_window_end,
-            )?);
+            match fetch_public_product_candle_window(client, product_id, window_start, next_window_end) {
+                Ok(window) => candles.extend(window),
+                Err(error) if is_remote_rate_limited(&error) => {
+                    trim_candle_archive(&mut candles);
+                    return Ok(candles);
+                }
+                Err(error) => return Err(error),
+            }
             trim_candle_archive(&mut candles);
             let new_oldest = candles.first().map(|item| item.start);
             next_window_end = new_oldest
@@ -3943,7 +3972,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="card-header">
             <div>
               <h2 class="card-title">${escapeHtml(watch.symbol)}${displayName}</h2>
-              <div class="subtext">Flat-mode re-entry watch | Underlying: ${escapeHtml(watch.underlying_type || "unknown")}</div>
+              <div class="subtext">Stock-perp watch | Underlying: ${escapeHtml(watch.underlying_type || "unknown")}</div>
             </div>
             <div class="badges">
               <span class="badge ${badgeClass(assessment?.alignment_status || watch.market_bias)}">${escapeHtml(assessment?.alignment_status || watch.market_bias)}</span>
@@ -4001,13 +4030,53 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="history-meta">Robust window: ${history?.long_horizon ? `${history.long_horizon.buckets} buckets x ${formatMaybe(history.long_horizon.bucket_minutes, 0)} min, ~${formatMaybe(history.long_horizon.approx_window_hours, 1)} h, latest ${history.long_horizon.latest_label || "unknown"}` : "building from rollups"}</div>
           <ul class="history-insights">${longInsights}</ul>
 
-          <div class="signal-note">Re-entry watch is a conservative heuristic. It is not a signal to trade by itself.</div>
+          <div class="signal-note">Stock-perp watch is a conservative heuristic. It is not a signal to trade by itself.</div>
           <ul class="history-insights">${watchNotes}</ul>
 
           <div class="signal-note">Watch signals are derived from live product and product-book fields while you are flat.</div>
           <ul class="signals">${signals}</ul>
         </article>
       `;
+    }
+
+    function sortedWatches(snapshot) {
+      const watches = [...(snapshot.watch_markets || [])];
+      if (!watches.length) {
+        return watches;
+      }
+
+      const rank = (watch) => {
+        const assessment = snapshot.watch_assessments?.[watch.symbol];
+        const checklist = snapshot.watch_entry_checklists?.[watch.symbol];
+        const sizingPlan = snapshot.watch_entry_sizing_plans?.[watch.symbol];
+        const prediction = snapshot.watch_predictions?.[watch.symbol];
+        return {
+          gate: checklist?.overall_status === "ready" ? 1 : 0,
+          marginUse: sizingPlan?.margin_usage_pct || 0,
+          lev: assessment?.suggested_max_leverage || 0,
+          prob: prediction?.probability_up || 0.5,
+          spread: watch.order_book?.spread_bps ?? Number.POSITIVE_INFINITY,
+        };
+      };
+
+      watches.sort((left, right) => {
+        const a = rank(left);
+        const b = rank(right);
+        return (
+          b.gate - a.gate ||
+          b.marginUse - a.marginUse ||
+          b.lev - a.lev ||
+          b.prob - a.prob ||
+          a.spread - b.spread ||
+          left.symbol.localeCompare(right.symbol)
+        );
+      });
+
+      return watches;
+    }
+
+    function primaryWatch(snapshot) {
+      return sortedWatches(snapshot)[0] || null;
     }
 
     function positionCard(pos, history, assessment, prediction) {
@@ -4117,7 +4186,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     function render(snapshot) {
       latestSnapshot = snapshot;
       const first = snapshot.positions[0];
-      const firstWatch = snapshot.watch_markets?.[0];
+      const firstWatch = primaryWatch(snapshot);
       const firstSetup = first
         ? snapshot.setup_assessments?.[first.symbol]
         : (firstWatch ? snapshot.watch_assessments?.[firstWatch.symbol] : null);
@@ -4131,6 +4200,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById("heroGrid").innerHTML = [
         metricCard("Positions", String(snapshot.positions.length)),
         metricCard("Open Orders", String((snapshot.open_orders || []).length)),
+        metricCard("Stock Watches", String((snapshot.watch_markets || []).length)),
         metricCard(
           "Portfolio",
           snapshot.portfolio?.portfolio_type || "unknown",
@@ -4138,6 +4208,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           snapshot.portfolio?.id ? shortId(snapshot.portfolio.id) : ""
         ),
         metricCard("Credential Source", snapshot.credential_source || "unknown", "compact"),
+        metricCard("Primary Watch", first?.symbol || firstWatch?.symbol || "n/a", "compact"),
         metricCard("Setup Status", firstSetup?.alignment_status || "no position"),
         metricCard("Entry Gate", firstChecklist?.overall_status || "n/a"),
         metricCard("Macro Risk", snapshot.market_context?.event_risk || "unknown"),
@@ -4149,13 +4220,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       ].join("");
 
       const cards = document.getElementById("cards");
+      const sortedWatchMarkets = sortedWatches(snapshot);
+      const watchHtml = sortedWatchMarkets.length
+        ? sortedWatchMarkets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol], snapshot.watch_entry_sizing_plans?.[watch.symbol], snapshot.watch_predictions?.[watch.symbol])).join("")
+        : `<div class="empty"><h2>No stock watch markets available</h2><div class="empty-copy">The dashboard could not load the current stock-perp universe from Coinbase.</div></div>`;
       if (!snapshot.positions.length) {
-        const watchHtml = (snapshot.watch_markets || []).length
-          ? snapshot.watch_markets.map((watch) => watchCard(watch, snapshot.position_history?.[watch.symbol], snapshot.watch_assessments?.[watch.symbol], snapshot.watch_entry_checklists?.[watch.symbol], snapshot.watch_entry_sizing_plans?.[watch.symbol], snapshot.watch_predictions?.[watch.symbol])).join("")
-          : `<div class="empty"><h2>No watch markets yet</h2><div class="empty-copy">Build history on a symbol or leave a related order open to keep a live flat-mode watch here.</div></div>`;
-        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is now showing order visibility and re-entry watch conditions instead of a blank state.</div></div>${watchHtml}`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}<div class="empty"><h2>No open positions</h2><div class="empty-copy">You are flat. The dashboard is scanning the full available stock-perp list and showing entry conditions for each market.</div></div>${watchHtml}`;
       } else {
-        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol], snapshot.position_predictions?.[position.symbol])).join("")}`;
+        cards.innerHTML = `${marketContextPanels(snapshot.market_context)}${openOrdersPanel(snapshot.open_orders)}${snapshot.positions.map((position) => positionCard(position, snapshot.position_history?.[position.symbol], snapshot.setup_assessments?.[position.symbol], snapshot.position_predictions?.[position.symbol])).join("")}${watchHtml}`;
       }
     }
 
@@ -4223,7 +4295,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(html)
 }
 
-fn derive_watch_symbols(history: &HashMap<String, PersistedSymbolHistory>) -> Vec<String> {
+fn derive_recent_watch_symbols(history: &HashMap<String, PersistedSymbolHistory>) -> Vec<String> {
     let mut ranked = history
         .iter()
         .filter_map(|(symbol, item)| {
@@ -4240,9 +4312,22 @@ fn derive_watch_symbols(history: &HashMap<String, PersistedSymbolHistory>) -> Ve
 }
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Ok(cache) = state.snapshot_cache.lock() {
+        if let Some(cached) = cache.as_ref() {
+            if now_millis().saturating_sub(cached.loaded_at_ms) <= SNAPSHOT_CACHE_TTL_MS {
+                return (
+                    StatusCode::OK,
+                    [(CONTENT_TYPE, "application/json")],
+                    cached.body.clone(),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let portfolio = state.portfolio.clone();
-    let watch_symbols = match state.history.lock() {
-        Ok(history) => derive_watch_symbols(&history),
+    let fallback_watch_symbols = match state.history.lock() {
+        Ok(history) => derive_recent_watch_symbols(&history),
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4250,6 +4335,10 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             )
                 .into_response()
         }
+    };
+    let watch_symbols = match tokio::task::spawn_blocking(load_available_stock_watch_symbols).await {
+        Ok(Ok(symbols)) if !symbols.is_empty() => symbols,
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => fallback_watch_symbols,
     };
 
     match tokio::task::spawn_blocking(move || load_output_with_watch(portfolio.as_deref(), &watch_symbols))
@@ -4517,7 +4606,28 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 position_predictions,
                 watch_predictions,
             };
-            (StatusCode::OK, Json(payload)).into_response()
+            let body = match serde_json::to_string(&payload) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to serialize dashboard snapshot: {error:#}"),
+                    )
+                        .into_response()
+                }
+            };
+            if let Ok(mut cache) = state.snapshot_cache.lock() {
+                *cache = Some(CachedSnapshot {
+                    loaded_at_ms: now_millis(),
+                    body: body.clone(),
+                });
+            }
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
         }
         Ok(Err(error)) => (
             StatusCode::BAD_GATEWAY,
@@ -4552,6 +4662,7 @@ async fn main() -> Result<()> {
         history: Mutex::new(history),
         market_context_cache: Mutex::new(None),
         prediction_cache: Mutex::new(HashMap::new()),
+        snapshot_cache: Mutex::new(None),
     });
 
     let app = Router::new()
