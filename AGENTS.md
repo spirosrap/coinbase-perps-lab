@@ -50,7 +50,7 @@ The current discovery script prefers the perps pair first.
 - Prefer returning concise summaries plus optional JSON output for automation
 - When behavior depends on Coinbase specifics, verify against current upstream docs or observed API behavior
 - For execution sizing, treat leverage as a whole-number control in this workflow; do not target fractional leverage such as `1.5x` or `2.5x`
-- Let margin allocation absorb the difference when the raw sizing math lands between integer leverage steps
+- When raw sizing math lands between integer leverage steps, prefer the higher whole-number leverage if it stays within the dashboard cap, then adjust margin allocation to preserve target notional
 
 ## Documentation rules
 

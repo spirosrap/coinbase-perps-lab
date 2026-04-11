@@ -3068,12 +3068,11 @@ fn build_watch_entry_sizing_plan(
     assessment: &TradeSetupAssessment,
     checklist: &EntryChecklist,
 ) -> EntrySizingPlan {
-    let (status, margin_usage_pct, reserve_pct, leverage_fraction_pct, summary, mut notes) =
+    let (status, base_margin_usage_pct, leverage_fraction_pct, summary, mut notes) =
         if checklist.overall_status == "ready" {
             (
                 "ready".to_string(),
                 60.0,
-                40.0,
                 100.0,
                 "Use 60% of available INTX margin for position collateral and keep 40% in reserve."
                     .to_string(),
@@ -3089,7 +3088,6 @@ fn build_watch_entry_sizing_plan(
                 "aligned" => (
                     "starter".to_string(),
                     40.0,
-                    60.0,
                     75.0,
                     "Conditions are improving, but the gate is not fully ready. Size as a starter only."
                         .to_string(),
@@ -3103,7 +3101,6 @@ fn build_watch_entry_sizing_plan(
                 "mixed" => (
                     "probe".to_string(),
                     25.0,
-                    75.0,
                     50.0,
                     "Setup is mixed. If you insist on entering early, keep it to a small probe."
                         .to_string(),
@@ -3117,7 +3114,6 @@ fn build_watch_entry_sizing_plan(
                 _ => (
                     "stand aside".to_string(),
                     0.0,
-                    100.0,
                     0.0,
                     "Do not allocate new margin while the dashboard is still in avoid-aggression mode."
                         .to_string(),
@@ -3138,13 +3134,32 @@ fn build_watch_entry_sizing_plan(
         raw_suggested_actual_leverage,
         assessment.suggested_max_leverage,
     );
+    let leverage_preservation_ratio = if suggested_actual_leverage > 0.0 {
+        raw_suggested_actual_leverage / suggested_actual_leverage
+    } else {
+        1.0
+    };
+    let margin_usage_pct = (base_margin_usage_pct * leverage_preservation_ratio).min(100.0);
+    let reserve_pct = (100.0 - margin_usage_pct).max(0.0);
+
     if raw_suggested_actual_leverage > 0.0
         && (raw_suggested_actual_leverage - suggested_actual_leverage).abs() > 0.001
     {
         notes.push(format!(
-            "Execution leverage is normalized to whole-number steps; raw target {:.1}x becomes {:.0}x.",
+            "Execution leverage is normalized to whole-number steps with upward bias when the cap allows it; raw target {:.1}x becomes {:.0}x.",
             raw_suggested_actual_leverage, suggested_actual_leverage
         ));
+        if margin_usage_pct > base_margin_usage_pct {
+            notes.push(format!(
+                "Margin use is increased from {:.1}% to {:.1}% because the leverage cap forced a lower whole-number step.",
+                base_margin_usage_pct, margin_usage_pct
+            ));
+        } else if margin_usage_pct < base_margin_usage_pct {
+            notes.push(format!(
+                "Margin use is reduced from {:.1}% to {:.1}% because the higher whole-number leverage step can preserve the target notional more efficiently.",
+                base_margin_usage_pct, margin_usage_pct
+            ));
+        }
     }
 
     EntrySizingPlan {
@@ -3165,7 +3180,7 @@ fn normalize_execution_leverage(raw_target: f64, max_cap: f64) -> f64 {
     }
 
     let integer_cap = max_cap.floor().max(1.0);
-    raw_target.floor().max(1.0).min(integer_cap)
+    raw_target.ceil().max(1.0).min(integer_cap)
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>

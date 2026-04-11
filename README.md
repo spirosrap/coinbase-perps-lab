@@ -174,7 +174,8 @@ This setup layer is intentionally conservative and non-binding. It is context, n
 - `mixed` uses `25%`, keeps `75%` in reserve, and allows up to `50%` of the leverage cap
 - `avoid aggression` uses `0%` and waits
 - in the top shortlist, those percentages are applied sequentially on the remaining deployable margin, not independently on the full account each time
-- `Suggested Actual Lev` is normalized to whole-number execution steps, so a fractional raw target such as `1.5x` is displayed as `1x`
+- `Suggested Actual Lev` is normalized to whole-number execution steps with an upward bias when the cap allows it, so a fractional raw target such as `1.5x` becomes `2x`
+- when leverage is normalized, margin usage is adjusted up or down to preserve the original target notional instead of silently shrinking or overfunding the position
 - `Macro Risk` is now a combined context label:
 - `scheduled risk` comes from FOMC plus the official White House / OIRA macro calendar, and may also include the earnings proxy schedule for US equity ETF/perp watches
 - `headline risk` comes from a keyword-based geopolitical news scan and is heuristic by construction
