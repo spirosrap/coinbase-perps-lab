@@ -3734,6 +3734,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
       `;
     }
 
+    function positionStripTile(pos, assessment, prediction) {
+      const outlook = pos.position_outlook || assessment?.alignment_status || "live";
+      const confidence = assessment?.alignment_confidence || pos.outlook_confidence || null;
+      const probabilityText = prediction?.probability_up != null
+        ? `P up 1h ${formatMaybe(prediction.probability_up * 100, 1)}%`
+        : null;
+      const parts = [
+        pos.contracts ? `holding ${pos.contracts} contracts` : null,
+        pos.notional ? `notional ${pos.notional}` : null,
+        pos.aggregated_pnl ? `PnL ${pos.aggregated_pnl}` : null,
+        probabilityText,
+      ].filter(Boolean);
+
+      return `
+        <article class="candidate-tile">
+          <div class="candidate-symbol">${escapeHtml(pos.symbol)}</div>
+          <div class="subtext">${escapeHtml(pos.display_name || "Current position")}</div>
+          <div class="candidate-badges">
+            <span class="badge ${badgeClass(outlook)}">${escapeHtml(outlook)}</span>
+            ${confidence ? `<span class="badge neutral">${escapeHtml(confidence)} confidence</span>` : ""}
+            ${pos.effective_leverage != null ? `<span class="badge neutral">${escapeHtml(formatMaybe(pos.effective_leverage, 2))}x effective</span>` : ""}
+            ${pos.margin_mode ? `<span class="badge neutral">${escapeHtml(pos.margin_mode)}</span>` : ""}
+          </div>
+          <div class="candidate-meta">${escapeHtml(parts.join(" · ") || "Current live position")}</div>
+        </article>
+      `;
+    }
+
     function scenarioCard(label, value) {
       return `<div class="scenario"><div class="stat-label">${escapeHtml(label)}</div><div class="scenario-value ${toneClass(value)}">${escapeHtml(formatSigned(value, 2))}</div></div>`;
     }
@@ -4232,45 +4260,44 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const strip = document.getElementById("candidateStrip");
       const positions = snapshot.positions || [];
       const shortlist = buildShortlistAllocationItems(snapshot);
-      const items = [];
-
-      for (const pos of positions.slice(0, 1)) {
-        const assessment = snapshot.setup_assessments?.[pos.symbol];
-        const prediction = snapshot.position_predictions?.[pos.symbol];
-        items.push({
-          symbol: pos.symbol,
-          subtitle: "Current position",
-          status: assessment?.alignment_status || pos.position_outlook || "live",
-          lev: assessment?.suggested_max_leverage ?? null,
-          marginUse: null,
-          allocationTotal: null,
-          allocationOfRemaining: null,
-          modelBias: prediction?.model_bias || null,
-          probabilityUp: prediction?.probability_up ?? null,
-          note: `holding ${pos.contracts || "unknown"} contracts; excluded from new-entry cascade`,
-        });
-      }
-
-      items.push(...shortlist.items);
-
-      if (!items.length) {
+      if (!positions.length && !shortlist.items.length) {
         strip.innerHTML = "";
         return;
       }
 
-      strip.innerHTML = `
+      const positionsHtml = positions.length ? `
+        <section class="candidate-panel">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Current Positions</h2>
+              <div class="subtext">Compact live position list so you do not need to scroll to the full cards.</div>
+            </div>
+          </div>
+          <div class="candidate-list">
+            ${positions.map((pos) => positionStripTile(
+              pos,
+              snapshot.setup_assessments?.[pos.symbol],
+              snapshot.position_predictions?.[pos.symbol],
+            )).join("")}
+          </div>
+        </section>
+      ` : "";
+
+      const shortlistHtml = shortlist.items.length ? `
         <section class="candidate-panel">
           <div class="card-header">
             <div>
               <h2 class="card-title">Entry Shortlist</h2>
-              <div class="subtext">Current position plus the top ranked stock-perp candidates. New-entry sizing now cascades on remaining deployable margin, so lower-ranked ideas get a smaller slice automatically.</div>
+              <div class="subtext">Top ranked stock-perp candidates for new entries. New-entry sizing cascades on remaining deployable margin, so lower-ranked ideas get a smaller slice automatically.</div>
             </div>
           </div>
-          <div class="candidate-list">${items.map((item) => shortlistTile(item)).join("")}</div>
-          <div class="signal-note">Each candidate uses its stated sizing percentage on the remaining deployable margin after higher-ranked candidates. Current positions are displayed for context and do not consume this new-entry cascade.</div>
+          <div class="candidate-list">${shortlist.items.map((item) => shortlistTile(item)).join("")}</div>
+          <div class="signal-note">Each candidate uses its stated sizing percentage on the remaining deployable margin after higher-ranked candidates. Current positions are shown separately and do not consume this new-entry cascade.</div>
           <div class="signal-note">Unallocated deployable margin after the visible shortlist: ${escapeHtml(formatMaybe(shortlist.remainingPct, 1))}%.</div>
         </section>
-      `;
+      ` : "";
+
+      strip.innerHTML = `${positionsHtml}${shortlistHtml}`;
     }
 
     function positionCard(pos, history, assessment, prediction) {
