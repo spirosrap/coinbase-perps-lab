@@ -3482,6 +3482,48 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 0.94rem;
       color: var(--muted);
     }
+    .candidate-strip {
+      margin-top: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .candidate-panel {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+      box-shadow: 0 24px 50px rgba(30, 36, 43, 0.08);
+      padding: 18px 22px;
+    }
+    .candidate-list {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      margin-top: 12px;
+    }
+    .candidate-tile {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel-strong);
+      padding: 14px;
+    }
+    .candidate-symbol {
+      font-size: 1rem;
+      font-weight: 760;
+      line-height: 1.2;
+      margin-bottom: 8px;
+    }
+    .candidate-meta {
+      font-size: 0.88rem;
+      color: var(--muted);
+      line-height: 1.35;
+      margin-top: 8px;
+    }
+    .candidate-badges {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
     .empty {
       text-align: center;
       padding: 42px 20px;
@@ -3527,6 +3569,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="hero-grid" id="heroGrid"></div>
       <div class="footer" id="analysisBasis"></div>
     </section>
+    <section id="candidateStrip" class="candidate-strip"></section>
     <section id="errorBox" class="error"></section>
     <section id="cards" class="cards"></section>
   </main>
@@ -3621,6 +3664,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     function statCard(label, value, extraClass = "") {
       return `<div class="stat"><div class="stat-label">${escapeHtml(label)}</div><div class="stat-value ${extraClass}">${escapeHtml(value)}</div></div>`;
+    }
+
+    function shortlistTile({ symbol, subtitle, status, lev, marginUse, modelBias, probabilityUp, note }) {
+      const probabilityText = probabilityUp != null ? `P up 1h ${formatMaybe(probabilityUp * 100, 1)}%` : null;
+      return `
+        <article class="candidate-tile">
+          <div class="candidate-symbol">${escapeHtml(symbol)}</div>
+          <div class="subtext">${escapeHtml(subtitle)}</div>
+          <div class="candidate-badges">
+            ${status ? `<span class="badge ${badgeClass(status)}">${escapeHtml(status)}</span>` : ""}
+            ${lev != null ? `<span class="badge neutral">cap ${escapeHtml(formatMaybe(lev, 0))}x</span>` : ""}
+            ${marginUse != null ? `<span class="badge neutral">use ${escapeHtml(formatMaybe(marginUse, 0))}%</span>` : ""}
+            ${modelBias ? `<span class="badge ${badgeClass(modelBias)}">${escapeHtml(modelBias)}</span>` : ""}
+          </div>
+          <div class="candidate-meta">${escapeHtml([note, probabilityText].filter(Boolean).join(" · ") || "No extra context")}</div>
+        </article>
+      `;
     }
 
     function scenarioCard(label, value) {
@@ -4079,6 +4139,62 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return sortedWatches(snapshot)[0] || null;
     }
 
+    function renderCandidateStrip(snapshot) {
+      const strip = document.getElementById("candidateStrip");
+      const positions = snapshot.positions || [];
+      const watches = sortedWatches(snapshot);
+      const items = [];
+
+      for (const pos of positions.slice(0, 1)) {
+        const assessment = snapshot.setup_assessments?.[pos.symbol];
+        const prediction = snapshot.position_predictions?.[pos.symbol];
+        items.push({
+          symbol: pos.symbol,
+          subtitle: "Current position",
+          status: assessment?.alignment_status || pos.position_outlook || "live",
+          lev: assessment?.suggested_max_leverage ?? null,
+          marginUse: null,
+          modelBias: prediction?.model_bias || null,
+          probabilityUp: prediction?.probability_up ?? null,
+          note: `holding ${pos.contracts || "unknown"} contracts`,
+        });
+      }
+
+      for (const watch of watches.slice(0, 4)) {
+        const assessment = snapshot.watch_assessments?.[watch.symbol];
+        const checklist = snapshot.watch_entry_checklists?.[watch.symbol];
+        const sizingPlan = snapshot.watch_entry_sizing_plans?.[watch.symbol];
+        const prediction = snapshot.watch_predictions?.[watch.symbol];
+        items.push({
+          symbol: watch.symbol,
+          subtitle: watch.display_name || "Stock-perp watch",
+          status: checklist?.overall_status || assessment?.alignment_status || "watch",
+          lev: assessment?.suggested_max_leverage ?? null,
+          marginUse: sizingPlan?.margin_usage_pct ?? null,
+          modelBias: prediction?.model_bias || null,
+          probabilityUp: prediction?.probability_up ?? null,
+          note: assessment?.execution_risk ? `execution ${assessment.execution_risk}` : "watching",
+        });
+      }
+
+      if (!items.length) {
+        strip.innerHTML = "";
+        return;
+      }
+
+      strip.innerHTML = `
+        <section class="candidate-panel">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Entry Shortlist</h2>
+              <div class="subtext">Current position plus the top ranked stock-perp candidates, so you do not need to scroll through the full watch list.</div>
+            </div>
+          </div>
+          <div class="candidate-list">${items.map((item) => shortlistTile(item)).join("")}</div>
+        </section>
+      `;
+    }
+
     function positionCard(pos, history, assessment, prediction) {
       const displayName = pos.display_name ? ` (${escapeHtml(pos.display_name)})` : "";
       const signals = (pos.signals || []).map((signal) => `<li>${escapeHtml(signal)}</li>`).join("");
@@ -4218,6 +4334,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         metricCard("Stale Cleanup", String(staleCount)),
         metricCard("Effective Leverage", first?.effective_leverage != null ? `${formatMaybe(first.effective_leverage, 2)}x` : "flat"),
       ].join("");
+      renderCandidateStrip(snapshot);
 
       const cards = document.getElementById("cards");
       const sortedWatchMarkets = sortedWatches(snapshot);

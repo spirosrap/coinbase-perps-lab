@@ -152,6 +152,7 @@ The dashboard also adds a conservative setup layer:
 - live open-order visibility for current futures/perpetual orders
 - stale reduce-only cleanup review when no matching position is open
 - live stock-perp watch cards for all currently available Coinbase INTX equity and equity-ETF perpetuals
+- a compact top-of-page entry shortlist that keeps the current position and top ranked stock-perp candidates visible without scrolling through the full watch section
 - a strict pass/fail long-entry gate for flat-mode watch cards
 - a percentage-based entry sizing plan for flat-mode watch cards, including margin use, reserve, and actual leverage guidance
 - an experimental multi-horizon directional baseline model that trains locally on `5` minute data and shows `1h`, `4h`, and `next close` forecasts, with walk-forward validation stats, model variant, class balance, and edge versus baseline
