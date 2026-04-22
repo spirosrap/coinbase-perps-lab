@@ -32,11 +32,10 @@ const DEFAULT_HISTORY_FILE: &str = ".local/perps_dashboard_history.json";
 const MARKET_CONTEXT_TTL_MS: u64 = 30 * 60 * 1000;
 const MODEL_PREDICTION_TTL_MS: u64 = 5 * 60 * 1000;
 const SNAPSHOT_CACHE_TTL_MS: u64 = 60 * 1000;
+const WATCH_SYMBOL_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const MODEL_CANDLE_GRANULARITY: &str = "FIVE_MINUTE";
 const MODEL_GRANULARITY_MINUTES: u32 = 5;
-const MODEL_HORIZON_MINUTES: u32 = 60;
 const MODEL_CANDLE_LIMIT: usize = 350;
-const MODEL_CANDLE_WINDOWS: usize = 6;
 const MODEL_CANDLE_RECENT_WINDOWS: usize = 2;
 const MODEL_CANDLE_ARCHIVE_TARGET_BARS: usize = 2_500;
 const MODEL_CANDLE_ARCHIVE_BACKFILL_WINDOWS_PER_SYNC: usize = 1;
@@ -105,8 +104,12 @@ struct AppState {
     history_file: PathBuf,
     history: Mutex<HashMap<String, PersistedSymbolHistory>>,
     market_context_cache: Mutex<Option<CachedMarketContext>>,
+    market_context_inflight: Mutex<bool>,
     prediction_cache: Mutex<HashMap<String, CachedPrediction>>,
+    prediction_refresh_inflight: Mutex<bool>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    watch_symbol_cache: Mutex<Option<CachedWatchSymbols>>,
+    candle_sync_inflight: Mutex<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +135,12 @@ struct CachedPrediction {
 struct CachedSnapshot {
     loaded_at_ms: u64,
     body: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedWatchSymbols {
+    loaded_at_ms: u64,
+    symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,22 +786,32 @@ fn fetch_public_product_candle_window(
         .collect())
 }
 
-fn fetch_public_product_candles(client: &Client, product_id: &str) -> Result<Vec<CandleBar>> {
-    let end = Utc::now().timestamp();
-    let span_seconds = candle_window_span_seconds();
-    let mut candles = Vec::new();
-    for window_index in 0..MODEL_CANDLE_WINDOWS {
-        let window_end = end - (window_index as i64 * span_seconds);
-        let window_start = window_end - span_seconds;
-        candles.extend(fetch_public_product_candle_window(
-            client,
-            product_id,
-            window_start,
-            window_end,
-        )?);
+async fn load_watch_symbols_cached(
+    state: &Arc<AppState>,
+    fallback_watch_symbols: Vec<String>,
+) -> Vec<String> {
+    if let Ok(cache) = state.watch_symbol_cache.lock() {
+        if let Some(cached) = cache.as_ref() {
+            if now_millis().saturating_sub(cached.loaded_at_ms) <= WATCH_SYMBOL_CACHE_TTL_MS
+                && !cached.symbols.is_empty()
+            {
+                return cached.symbols.clone();
+            }
+        }
     }
-    trim_candle_archive(&mut candles);
-    Ok(candles)
+
+    match tokio::task::spawn_blocking(load_available_stock_watch_symbols).await {
+        Ok(Ok(symbols)) if !symbols.is_empty() => {
+            if let Ok(mut cache) = state.watch_symbol_cache.lock() {
+                *cache = Some(CachedWatchSymbols {
+                    loaded_at_ms: now_millis(),
+                    symbols: symbols.clone(),
+                });
+            }
+            symbols
+        }
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => fallback_watch_symbols,
+    }
 }
 
 fn sync_persisted_candle_archive(
@@ -857,6 +876,90 @@ fn sync_persisted_candle_archive(
     }
 
     Ok(candles)
+}
+
+fn spawn_background_candle_sync(state: Arc<AppState>, symbols: Vec<String>) {
+    let should_start = match state.candle_sync_inflight.lock() {
+        Ok(mut inflight) => {
+            if *inflight {
+                false
+            } else {
+                *inflight = true;
+                true
+            }
+        }
+        Err(_) => false,
+    };
+
+    if !should_start {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let existing_archives = match state.history.lock() {
+            Ok(history) => symbols
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.clone(),
+                        history
+                            .get(symbol)
+                            .map(|item| item.candles.clone())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                if let Ok(mut inflight) = state.candle_sync_inflight.lock() {
+                    *inflight = false;
+                }
+                return;
+            }
+        };
+
+        let sync_result = tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<CandleBar>>> {
+            let client = build_http_client()?;
+            let mut archives = HashMap::new();
+            for (symbol, existing) in existing_archives {
+                archives.insert(
+                    symbol.clone(),
+                    sync_persisted_candle_archive(&client, &symbol, &existing)?,
+                );
+            }
+            Ok(archives)
+        })
+        .await;
+
+        if let Ok(Ok(archives)) = sync_result {
+            let mut updated_any = false;
+            if let Ok(mut history) = state.history.lock() {
+                for (symbol, candles) in archives {
+                    let existing_len = history
+                        .get(&symbol)
+                        .map(|item| item.candles.len())
+                        .unwrap_or_default();
+                    let new_len = candles.len();
+                    if new_len != existing_len {
+                        updated_any = true;
+                    }
+                    upsert_candle_archive(&mut history, &symbol, candles);
+                }
+                let _ = save_history_file(&state.history_file, &history);
+            }
+            if updated_any {
+                if let Ok(mut cache) = state.prediction_cache.lock() {
+                    cache.clear();
+                }
+                if let Ok(mut cache) = state.snapshot_cache.lock() {
+                    *cache = None;
+                }
+            }
+        }
+
+        if let Ok(mut inflight) = state.candle_sync_inflight.lock() {
+            *inflight = false;
+        }
+    });
 }
 
 fn rolling_mean(values: &[f64]) -> Option<f64> {
@@ -1524,14 +1627,14 @@ fn build_history_augmented_model_prediction(
 }
 
 fn build_model_prediction(
-    client: &Client,
+    _client: &Client,
     product_id: &str,
     history: Option<&PersistedSymbolHistory>,
 ) -> Result<ModelPrediction> {
     let candles = history
         .filter(|item| !item.candles.is_empty())
         .map(|item| item.candles.clone())
-        .unwrap_or(fetch_public_product_candles(client, product_id)?);
+        .unwrap_or_default();
     let mut built = Vec::new();
     for target in MODEL_TARGETS {
         let mut prediction = if let Some(history) = history {
@@ -1994,66 +2097,179 @@ fn build_market_context_scope(output: &Output) -> MarketContextScope {
     }
 }
 
-fn load_prediction_for_symbol(
+fn placeholder_market_context() -> MarketContext {
+    MarketContext {
+        headlines: Vec::new(),
+        upcoming_events: Vec::new(),
+        scheduled_risk: "unknown".to_string(),
+        headline_risk: "unknown".to_string(),
+        event_risk: "unknown".to_string(),
+        notes: vec!["Market context is warming in the background.".to_string()],
+    }
+}
+
+fn placeholder_prediction_for_target(
+    target: PredictionTarget,
+    history: Option<&PersistedSymbolHistory>,
+) -> ModelPrediction {
+    let bucket_count = history.map(|item| item.rollups.len()).unwrap_or(0);
+    let mut prediction = empty_prediction_shell(
+        target,
+        "warming",
+        "collecting",
+        format!(
+            "Experimental model data for the {} horizon is warming in the background.",
+            target.label
+        ),
+        vec![
+            "Cached model output is not ready yet, so the dashboard is returning a placeholder for this symbol."
+                .to_string(),
+        ],
+    );
+    apply_model_readiness(&mut prediction, history);
+    if bucket_count > 0 {
+        prediction.notes.push(format!(
+            "Local rollup history is already present ({} buckets), but the cached model refresh has not finished yet.",
+            bucket_count
+        ));
+    }
+    prediction
+}
+
+fn placeholder_prediction(history: Option<&PersistedSymbolHistory>) -> ModelPrediction {
+    let mut horizons = MODEL_TARGETS.into_iter();
+    let mut primary = placeholder_prediction_for_target(
+        horizons
+            .next()
+            .expect("MODEL_TARGETS must contain a primary target"),
+        history,
+    );
+    primary.additional_horizons = horizons
+        .map(|target| placeholder_prediction_for_target(target, history))
+        .collect();
+    primary
+}
+
+fn cached_prediction_for_symbol(
     cache: &Mutex<HashMap<String, CachedPrediction>>,
     symbol: &str,
     history: Option<&PersistedSymbolHistory>,
-) -> Result<ModelPrediction> {
+) -> Option<ModelPrediction> {
     let history_signature = history_signature(history);
-    if let Ok(guard) = cache.lock() {
-        if let Some(entry) = guard.get(symbol) {
-            if entry.history_signature == history_signature
-                && now_millis().saturating_sub(entry.loaded_at_ms) <= MODEL_PREDICTION_TTL_MS
-            {
-                return Ok(entry.prediction.clone());
+    let guard = cache.lock().ok()?;
+    let entry = guard.get(symbol)?;
+    if entry.history_signature == history_signature
+        && now_millis().saturating_sub(entry.loaded_at_ms) <= MODEL_PREDICTION_TTL_MS
+    {
+        Some(entry.prediction.clone())
+    } else {
+        None
+    }
+}
+
+fn spawn_background_prediction_refresh(
+    state: Arc<AppState>,
+    prediction_inputs: Vec<(String, Option<PersistedSymbolHistory>)>,
+) {
+    let should_start = match state.prediction_refresh_inflight.lock() {
+        Ok(mut inflight) => {
+            if *inflight {
+                false
+            } else {
+                *inflight = true;
+                true
             }
         }
+        Err(_) => false,
+    };
+
+    if !should_start {
+        return;
     }
 
-    let client = build_http_client()?;
-    let prediction = build_model_prediction(&client, symbol, history).unwrap_or_else(|error| ModelPrediction {
-        horizon_label: "1h".to_string(),
-        variant: "error".to_string(),
-        status: "error".to_string(),
-        horizon_minutes: MODEL_HORIZON_MINUTES,
-        granularity: MODEL_CANDLE_GRANULARITY.to_string(),
-        evaluation_method: "Expanding walk-forward on non-overlapping 60-minute holdout anchors".to_string(),
-        probability_up: None,
-        probability_down: None,
-        model_bias: "unknown".to_string(),
-        confidence: "low".to_string(),
-        training_samples: 0,
-        test_samples: 0,
-        test_accuracy: None,
-        baseline_accuracy: None,
-        edge_vs_baseline_pct_points: None,
-        brier_score: None,
-        holdout_up_rate: None,
-        majority_label: None,
-        balanced_accuracy: None,
-        matthews_corrcoef: None,
-        readiness_stage: "collecting".to_string(),
-        rollup_buckets_collected: 0,
-        rollup_hours_collected: 0.0,
-        buckets_until_activation: MODEL_ACTIVATION_ROLLUP_BUCKETS,
-        hours_until_activation: rollup_buckets_to_hours(MODEL_ACTIVATION_ROLLUP_BUCKETS),
-        summary: "The experimental model could not be computed for this symbol.".to_string(),
-        notes: vec![format!("Prediction build failed: {error:#}")],
-        additional_horizons: Vec::new(),
+    tokio::spawn(async move {
+        let computed = tokio::task::spawn_blocking(move || -> Result<Vec<(String, u64, ModelPrediction)>> {
+            let client = build_http_client()?;
+            let mut results = Vec::new();
+            for (symbol, history) in prediction_inputs {
+                let prediction = build_model_prediction(&client, &symbol, history.as_ref())?;
+                let signature = history_signature(history.as_ref());
+                results.push((symbol, signature, prediction));
+            }
+            Ok(results)
+        })
+        .await;
+
+        if let Ok(Ok(results)) = computed {
+            if let Ok(mut cache) = state.prediction_cache.lock() {
+                for (symbol, history_signature, prediction) in results {
+                    cache.insert(
+                        symbol,
+                        CachedPrediction {
+                            loaded_at_ms: now_millis(),
+                            history_signature,
+                            prediction,
+                        },
+                    );
+                }
+            }
+            if let Ok(mut cache) = state.snapshot_cache.lock() {
+                *cache = None;
+            }
+        }
+
+        if let Ok(mut inflight) = state.prediction_refresh_inflight.lock() {
+            *inflight = false;
+        }
     });
+}
 
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(
-            symbol.to_string(),
-            CachedPrediction {
-                loaded_at_ms: now_millis(),
-                history_signature,
-                prediction: prediction.clone(),
-            },
-        );
+fn spawn_background_market_context_refresh(state: Arc<AppState>, scope: MarketContextScope) {
+    let should_start = match state.market_context_inflight.lock() {
+        Ok(mut inflight) => {
+            if *inflight {
+                false
+            } else {
+                *inflight = true;
+                true
+            }
+        }
+        Err(_) => false,
+    };
+
+    if !should_start {
+        return;
     }
 
-    Ok(prediction)
+    tokio::spawn(async move {
+        let scope_for_load = scope.clone();
+        let loaded_context = match tokio::task::spawn_blocking(move || -> Result<MarketContext> {
+            let client = build_http_client()?;
+            Ok(load_market_context(&client, &scope_for_load))
+        })
+        .await
+        {
+            Ok(Ok(context)) => Some(context),
+            _ => None,
+        };
+
+        if let Some(context) = loaded_context {
+            if let Ok(mut cache) = state.market_context_cache.lock() {
+                *cache = Some(CachedMarketContext {
+                    loaded_at_ms: now_millis(),
+                    scope,
+                    context,
+                });
+            }
+            if let Ok(mut cache) = state.snapshot_cache.lock() {
+                *cache = None;
+            }
+        }
+
+        if let Ok(mut inflight) = state.market_context_inflight.lock() {
+            *inflight = false;
+        }
+    });
 }
 
 fn load_market_context(client: &Client, scope: &MarketContextScope) -> MarketContext {
@@ -4558,10 +4774,7 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 .into_response()
         }
     };
-    let watch_symbols = match tokio::task::spawn_blocking(load_available_stock_watch_symbols).await {
-        Ok(Ok(symbols)) if !symbols.is_empty() => symbols,
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => fallback_watch_symbols,
-    };
+    let watch_symbols = load_watch_symbols_cached(&state, fallback_watch_symbols).await;
 
     match tokio::task::spawn_blocking(move || load_output_with_watch(portfolio.as_deref(), &watch_symbols))
         .await
@@ -4580,7 +4793,7 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     }
                 };
 
-                let maybe_cached = cached.filter(|entry| {
+                let maybe_cached = cached.clone().filter(|entry| {
                     entry.scope == scope
                         && now_millis().saturating_sub(entry.loaded_at_ms) <= MARKET_CONTEXT_TTL_MS
                 });
@@ -4588,48 +4801,11 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 if let Some(entry) = maybe_cached {
                     entry.context
                 } else {
-                    let scope_for_load = scope.clone();
-                    let loaded_context = match tokio::task::spawn_blocking(move || -> Result<MarketContext> {
-                        let client = build_http_client()?;
-                        Ok(load_market_context(&client, &scope_for_load))
-                    })
-                    .await
-                    {
-                        Ok(Ok(context)) => context,
-                        Ok(Err(error)) => {
-                            return (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Failed to load market context: {error:#}"),
-                            )
-                                .into_response()
-                        }
-                        Err(error) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Market context worker failed: {error}"),
-                            )
-                                .into_response()
-                        }
-                    };
-
-                    match state.market_context_cache.lock() {
-                        Ok(mut cache) => {
-                            *cache = Some(CachedMarketContext {
-                                loaded_at_ms: now_millis(),
-                                scope,
-                                context: loaded_context.clone(),
-                            });
-                        }
-                        Err(_) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Market context cache lock is poisoned".to_string(),
-                            )
-                                .into_response()
-                        }
-                    }
-
-                    loaded_context
+                    let stale_context = cached
+                        .filter(|entry| entry.scope == scope)
+                        .map(|entry| entry.context);
+                    spawn_background_market_context_refresh(Arc::clone(&state), scope.clone());
+                    stale_context.unwrap_or_else(placeholder_market_context)
                 }
             };
             let prediction_symbols = output
@@ -4640,61 +4816,9 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let existing_candle_archives = match state.history.lock() {
-                Ok(history) => prediction_symbols
-                    .iter()
-                    .map(|symbol| {
-                        (
-                            symbol.clone(),
-                            history
-                                .get(symbol)
-                                .map(|item| item.candles.clone())
-                                .unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                Err(_) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Dashboard history lock is poisoned".to_string(),
-                    )
-                        .into_response()
-                }
-            };
-            let synced_candle_archives = match tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<CandleBar>>> {
-                let client = build_http_client()?;
-                let mut archives = HashMap::new();
-                for (symbol, existing) in existing_candle_archives {
-                    archives.insert(
-                        symbol.clone(),
-                        sync_persisted_candle_archive(&client, &symbol, &existing)?,
-                    );
-                }
-                Ok(archives)
-            })
-            .await
-            {
-                Ok(Ok(items)) => items,
-                Ok(Err(error)) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to sync candle archive: {error:#}"),
-                    )
-                        .into_response()
-                }
-                Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Candle archive worker failed: {error}"),
-                    )
-                        .into_response()
-                }
-            };
+            spawn_background_candle_sync(Arc::clone(&state), prediction_symbols.clone());
             let (position_history, prediction_inputs) = match state.history.lock() {
                 Ok(mut history) => {
-                    for (symbol, candles) in synced_candle_archives {
-                        upsert_candle_archive(&mut history, &symbol, candles);
-                    }
                     let summaries = upsert_history(&mut history, &output, &market_context);
                     let prediction_inputs = prediction_symbols
                         .into_iter()
@@ -4717,39 +4841,21 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         .into_response()
                 }
             };
-            let state_for_predictions = Arc::clone(&state);
-            let predictions = match tokio::task::spawn_blocking(move || -> Result<HashMap<String, ModelPrediction>> {
-                let mut results = HashMap::new();
-                for (symbol, symbol_history) in prediction_inputs {
-                    results.insert(
-                        symbol.clone(),
-                        load_prediction_for_symbol(
-                            &state_for_predictions.prediction_cache,
-                            &symbol,
-                            symbol_history.as_ref(),
-                        )?,
-                    );
+            let mut predictions = HashMap::new();
+            let mut missing_predictions = Vec::new();
+            for (symbol, symbol_history) in &prediction_inputs {
+                if let Some(prediction) =
+                    cached_prediction_for_symbol(&state.prediction_cache, symbol, symbol_history.as_ref())
+                {
+                    predictions.insert(symbol.clone(), prediction);
+                } else {
+                    predictions.insert(symbol.clone(), placeholder_prediction(symbol_history.as_ref()));
+                    missing_predictions.push((symbol.clone(), symbol_history.clone()));
                 }
-                Ok(results)
-            })
-            .await
-            {
-                Ok(Ok(items)) => items,
-                Ok(Err(error)) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to load model predictions: {error:#}"),
-                    )
-                        .into_response()
-                }
-                Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Prediction worker failed: {error}"),
-                    )
-                        .into_response()
-                }
-            };
+            }
+            if !missing_predictions.is_empty() {
+                spawn_background_prediction_refresh(Arc::clone(&state), missing_predictions);
+            }
             let setup_assessments = output
                 .positions
                 .iter()
@@ -4883,8 +4989,12 @@ async fn main() -> Result<()> {
         history_file: args.history_file,
         history: Mutex::new(history),
         market_context_cache: Mutex::new(None),
+        market_context_inflight: Mutex::new(false),
         prediction_cache: Mutex::new(HashMap::new()),
+        prediction_refresh_inflight: Mutex::new(false),
         snapshot_cache: Mutex::new(None),
+        watch_symbol_cache: Mutex::new(None),
+        candle_sync_inflight: Mutex::new(false),
     });
 
     let app = Router::new()

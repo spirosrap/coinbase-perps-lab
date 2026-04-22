@@ -266,7 +266,7 @@ Funding intensity thresholds in this tool are heuristic:
 
 The dashboard no longer depends on a single hardcoded watch symbol. It now pulls the current Coinbase INTX perpetual product list, filters it to stock-linked markets (`EQUITY` and `EQUITY_ETF`), and renders the full available stock-perp universe in the watch section. If you have an open position, the dashboard still renders the remaining stock-perp watch cards underneath the live position cards so the scan stays useful while you are in a trade.
 
-For the full stock-perp scan, the first dashboard snapshot is heavier because it has to refresh multiple markets and warm local caches. After that, the server keeps a short in-memory snapshot cache so normal browser polling does not recompute the entire stock-perp universe on every refresh.
+For the full stock-perp scan, the first dashboard snapshot still has to refresh multiple markets, but it now returns from persisted history first and warms candle archives, market context, and model caches in the background instead of blocking the response on full backfill. On that very first response, some market-context fields may temporarily show `unknown` and some model cards may show a `warming` placeholder; later refreshes fill those in. After that, the server keeps a short in-memory snapshot cache so normal browser polling does not recompute the entire stock-perp universe on every refresh.
 
 Open interest is intentionally kept more factual than interpretive. A single snapshot can tell you:
 
